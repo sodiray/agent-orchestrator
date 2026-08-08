@@ -64,9 +64,25 @@ proxies the same session-scoped operations that it accepts for a local session:
 
 Each remote daemon remains the source of truth for its durable session facts.
 The local daemon consumes its session reads and SSE changes, qualifies them by
-`hostId`, and publishes a single local event surface for the frontend. It does
-not copy a remote daemon's SQLite state into its own database or recompute a
-remote session's display status from partial facts.
+`hostId`, and publishes a single local event surface for the frontend. While a
+local client is connected to that event surface, the local daemon keeps a
+subscription to each reachable remote daemon and reconnects a dropped remote
+stream with backoff. A remote outage is logged but does not end the local
+stream.
+
+The local database does not copy a remote daemon's schema or derive remote
+status. It does retain an opaque, last-known session view in
+`remote_session_snapshots` after a successful remote list. That small cache
+lets the board explain a remote session after a local restart while its owner
+is unavailable, instead of silently making the session disappear. Its display
+status and `activity_state` are still always the owning daemon's values; the
+local daemon never recomputes either from cached or partial facts.
+
+Forwarded event envelopes qualify `sessionId`, and their payloads qualify every
+session reference, including nested references such as `session`,
+`fromSession`, and `toSession`. Remote event sequence numbers are meaningful
+only to their owner, so they are not used as the local daemon's durable SSE
+replay cursor.
 
 ```mermaid
 flowchart LR
@@ -89,10 +105,15 @@ status; it does not invent a separate remote status reducer.
 ## Terminal paths
 
 The normal desktop terminal path remains available through the local daemon's
-`/mux` endpoint. Once a terminal attachment is associated with a composite
-identity, the local daemon relays the terminal protocol to the owning daemon's
-`/mux` endpoint over the forwarded path. This keeps the frontend on one
-WebSocket base while preserving terminal I/O for remote sessions.
+`/mux` endpoint. The mux protocol identifies a pane by its opaque runtime
+handle rather than a session id, so a remote session view qualifies its exposed
+terminal handle as `hostId~handleId`. The local daemon removes that routing
+prefix only while forwarding the existing mux frame to the owning daemon, and
+restores it on frames flowing back. Input, output, resize, and close frames
+therefore retain the mux protocol unchanged while the frontend stays on one
+WebSocket base. A dropped remote mux connection logs its reason, reports a
+terminal error, and closes the client socket rather than leaving a dead pane
+open.
 
 That relay is not the only terminal path, and it must never become a required
 intermediary. **Direct access survives the abstraction: any session, local or

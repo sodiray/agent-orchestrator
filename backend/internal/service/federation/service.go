@@ -126,6 +126,20 @@ func (s *Service) Resolve(ctx context.Context, id domain.RemoteHostID) (domain.R
 	return s.store.GetRemoteHost(ctx, id)
 }
 
+// HasRegisteredHosts keeps streaming surfaces on the local-only path when the
+// registry is empty. It deliberately consults the in-memory presence counter,
+// not SQLite.
+func (s *Service) HasRegisteredHosts() bool {
+	return s != nil && s.presence != nil && s.presence.HasRegisteredHosts()
+}
+
+// RemoteHosts returns the current registered hosts for a federation stream.
+// Callers must check HasRegisteredHosts first so an empty registry remains a
+// strict no-op.
+func (s *Service) RemoteHosts(ctx context.Context) ([]domain.RemoteHost, error) {
+	return s.store.ListRemoteHosts(ctx)
+}
+
 func (s *Service) listHost(ctx context.Context, host domain.RemoteHost, filter sessionsvc.ListFilter) []ListedSession {
 	if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
 		reason := fmt.Sprintf("remote host is %s", host.OperatorState)

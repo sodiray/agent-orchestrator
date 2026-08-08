@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +15,35 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/cdc"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 )
+
+type eventPresence bool
+
+func (p eventPresence) HasRegisteredHosts() bool { return bool(p) }
+
+type eventHostStore struct {
+	hosts []domain.RemoteHost
+	calls int
+}
+
+func (s *eventHostStore) ListRemoteHosts(context.Context) ([]domain.RemoteHost, error) {
+	s.calls++
+	return s.hosts, nil
+}
+
+func (*eventHostStore) GetRemoteHost(context.Context, domain.RemoteHostID) (domain.RemoteHost, bool, error) {
+	return domain.RemoteHost{}, false, nil
+}
+
+func (*eventHostStore) ReplaceRemoteSessionSnapshots(context.Context, domain.RemoteHostID, []domain.RemoteSessionSnapshot) error {
+	return nil
+}
+
+func (*eventHostStore) ListRemoteSessionSnapshots(context.Context, domain.RemoteHostID) ([]domain.RemoteSessionSnapshot, error) {
+	return nil, nil
+}
 
 type fakeEventSource struct {
 	live                    *fakeEventSubscriber
@@ -138,6 +167,119 @@ func TestWriteSSEEventSanitizesEventNameNewlines(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: session_updated_id: 999_data: injected\n") {
 		t.Fatalf("body = %q, want sanitized event name", body)
+	}
+}
+
+func TestQualifyRemoteEventQualifiesEnvelopeAndEveryPayloadSessionReference(t *testing.T) {
+	event, err := qualifyRemoteEvent("workstation", cdc.Event{
+		Seq:       7,
+		SessionID: "project-7",
+		Type:      cdc.EventSessionUpdated,
+		Payload: []byte(`{
+			"id":"project-7",
+			"sessionId":"project-7",
+			"session":"project-7",
+			"fromSession":"project-6",
+			"toSession":"project-8",
+			"nested":{"currentSessionId":"project-7","handledBySessionId":"project-7"}
+		}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.SessionID != "workstation~project-7" {
+		t.Fatalf("sessionId = %q", event.SessionID)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"id", "sessionId", "session", "fromSession", "toSession"} {
+		if got, ok := payload[key].(string); !ok || !strings.HasPrefix(got, "workstation~") {
+			t.Fatalf("payload[%q] = %#v, want qualified session id", key, payload[key])
+		}
+	}
+	nested := payload["nested"].(map[string]any)
+	for _, key := range []string{"currentSessionId", "handledBySessionId"} {
+		if got := nested[key]; got != "workstation~project-7" {
+			t.Fatalf("payload.nested[%q] = %#v", key, got)
+		}
+	}
+}
+
+func TestEventsRemoteFanInIsNoOpWithoutRegisteredHosts(t *testing.T) {
+	store := &eventHostStore{}
+	controller := &EventsController{Federation: federationsvc.New(federationsvc.Deps{
+		Store:    store,
+		Presence: eventPresence(false),
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	remote, wait := controller.remoteEvents(ctx, cancel)
+	defer wait()
+	if store.calls != 0 {
+		t.Fatalf("remote-host reads = %d, want 0", store.calls)
+	}
+	select {
+	case event := <-remote:
+		t.Fatalf("unexpected remote event: %#v", event)
+	default:
+	}
+}
+
+func TestRemoteEventFanInReconnectsAfterDroppedStream(t *testing.T) {
+	requests := make(chan string, 4)
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Query().Get("after")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		after := r.URL.Query().Get("after")
+		if after == "0" {
+			_, _ = w.Write([]byte("id: 1\nevent: session_updated\ndata: {\"seq\":1,\"sessionId\":\"project-7\",\"type\":\"session_updated\",\"payload\":{\"id\":\"project-7\"}}\n\n"))
+			flusher.Flush()
+			return
+		}
+		_, _ = w.Write([]byte("id: 2\nevent: session_updated\ndata: {\"seq\":2,\"sessionId\":\"project-7\",\"type\":\"session_updated\",\"payload\":{\"id\":\"project-7\"}}\n\n"))
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer remote.Close()
+	remoteURL, err := url.Parse(remote.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &eventHostStore{hosts: []domain.RemoteHost{{HostID: "workstation", Address: remoteURL.Host}}}
+	controller := &EventsController{Federation: federationsvc.New(federationsvc.Deps{
+		Store:    store,
+		Presence: eventPresence(true),
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan cdc.Event, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		controller.forwardRemoteEvents(ctx, cancel, store.hosts[0], out)
+	}()
+	for index := 0; index < 2; index++ {
+		select {
+		case event := <-out:
+			if event.SessionID != "workstation~project-7" {
+				t.Fatalf("qualified session id = %q", event.SessionID)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for forwarded remote event")
+		}
+	}
+	if first, second := <-requests, <-requests; first != "0" || second != "1" {
+		t.Fatalf("remote replay cursors = %q, %q", first, second)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("remote fan-in did not stop after local stream cancellation")
 	}
 }
 

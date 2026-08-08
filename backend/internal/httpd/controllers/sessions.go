@@ -1453,6 +1453,9 @@ func federatedSessionViews(sessions []federationsvc.ListedSession) []SessionView
 			continue
 		}
 		view.ID = domain.QualifySessionID(listed.Remote.HostID, listed.Remote.SessionID)
+		if view.TerminalHandleID != "" {
+			view.TerminalHandleID = string(domain.QualifySessionID(listed.Remote.HostID, domain.SessionID(view.TerminalHandleID)))
+		}
 		view.HostID = string(listed.Remote.HostID)
 		if listed.Remote.Available {
 			view.Availability = "available"

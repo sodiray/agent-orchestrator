@@ -2,6 +2,7 @@ package httpd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,11 +41,6 @@ func (p *sessionProxy) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if isRemoteSessionStream(r.URL.Path) {
-			envelope.WriteAPIError(w, r, http.StatusNotImplemented, "not_implemented", "REMOTE_SESSION_STREAM_UNSUPPORTED",
-				"Remote session streaming is not available yet", map[string]any{"hostId": qualified.HostID})
-			return
-		}
 		host, found, err := p.federation.Resolve(r.Context(), qualified.HostID)
 		if err != nil {
 			p.log.Error("resolve remote session host failed", "hostId", qualified.HostID, "err", err)
@@ -64,8 +60,48 @@ func (p *sessionProxy) Middleware(next http.Handler) http.Handler {
 				fmt.Sprintf("Remote host %q is unavailable: %s", host.HostID, reason), map[string]any{"hostId": host.HostID, "reason": reason})
 			return
 		}
+		if isRemoteSessionStream(r.URL.Path) {
+			p.forwardStream(w, r, host, qualified)
+			return
+		}
 		p.forward(w, r, host, qualified)
 	})
+}
+
+// forwardStream keeps the owning daemon's workspace watcher open for the
+// lifetime of the client request. The ordinary session proxy has a bounded
+// request timeout; applying that timeout here would turn a healthy SSE stream
+// into a periodic disconnect.
+func (p *sessionProxy) forwardStream(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedSessionID) {
+	target, err := remoteSessionURL(r.URL, host.Address, qualified.SessionID)
+	if err != nil {
+		p.log.Error("build remote session stream target failed", "hostId", host.HostID, "err", err)
+		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_UNREACHABLE",
+			fmt.Sprintf("Remote host %q is unavailable: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		p.log.Error("build remote session stream request failed", "hostId", host.HostID, "err", err)
+		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_UNREACHABLE",
+			fmt.Sprintf("Remote host %q is unavailable: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+		return
+	}
+	req.Header = r.Header.Clone()
+	removeHopHeaders(req.Header)
+	resp, err := http.DefaultClient.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		p.log.Warn("remote session stream failed", "hostId", host.HostID, "address", host.Address, "err", err)
+		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_UNREACHABLE",
+			fmt.Sprintf("Remote host %q is unavailable: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
+		p.log.Warn("copy remote session stream response failed", "hostId", host.HostID, "err", err)
+	}
 }
 
 func (p *sessionProxy) forward(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedSessionID) {
