@@ -60,14 +60,19 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          # Point `ao start` at the repository these binaries are published from,
+          # so a fork's release fetches the fork's desktop app rather than the
+          # upstream one baked in at compile time.
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           version="$RELEASE_TAG"
           commit="$(git rev-parse --short=12 "$RELEASE_TAG^{commit}")"
           date="$(git show -s --format=%cI "$RELEASE_TAG^{commit}")"
           archive="ao_${version}_${GOOS}_${GOARCH}.tar.gz"
           mkdir -p dist
+          pkg="github.com/aoagents/agent-orchestrator/backend/internal/cli"
           CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X github.com/aoagents/agent-orchestrator/backend/internal/cli.Version=$version -X github.com/aoagents/agent-orchestrator/backend/internal/cli.Commit=$commit -X github.com/aoagents/agent-orchestrator/backend/internal/cli.Date=$date" \
+            -ldflags "-s -w -X $pkg.Version=$version -X $pkg.Commit=$commit -X $pkg.Date=$date -X $pkg.releaseRepo=$RELEASE_REPO" \
             -o dist/ao ./cmd/ao
           tar -C dist -czf "dist/$archive" ao
           rm dist/ao
