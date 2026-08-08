@@ -1,0 +1,125 @@
+name: CLI release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to release (for example, v1.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Verify release tag
+        shell: bash
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "release tag must begin with v: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+
+      - name: Build archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          version="$RELEASE_TAG"
+          commit="$(git rev-parse --short=12 "$RELEASE_TAG^{commit}")"
+          date="$(git show -s --format=%cI "$RELEASE_TAG^{commit}")"
+          archive="ao_${version}_${GOOS}_${GOARCH}.tar.gz"
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/aoagents/agent-orchestrator/backend/internal/cli.Version=$version -X github.com/aoagents/agent-orchestrator/backend/internal/cli.Commit=$commit -X github.com/aoagents/agent-orchestrator/backend/internal/cli.Date=$date" \
+            -o dist/ao ./cmd/ao
+          tar -C dist -czf "dist/$archive" ao
+          rm dist/ao
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: backend/dist/ao_${{ env.RELEASE_TAG }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify release tag
+        shell: bash
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "release tag must begin with v: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cli-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ao_*.tar.gz > SHA256SUMS
+
+      - name: Publish release assets
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TAG" --generate-notes
