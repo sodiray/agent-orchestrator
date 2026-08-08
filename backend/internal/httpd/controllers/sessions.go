@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	previewutil "github.com/aoagents/agent-orchestrator/backend/internal/preview"
 	"github.com/aoagents/agent-orchestrator/backend/internal/previewserver"
+	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 	"github.com/aoagents/agent-orchestrator/backend/internal/workspacewatch"
@@ -123,6 +125,7 @@ type SessionsController struct {
 	Usage         UsageHookRecorder
 	PreviewServer ManagedPreviewServer
 	Capabilities  SessionCapabilityValidator
+	Federation    *federationsvc.Service
 }
 
 // Register mounts the session routes on the supplied router.
@@ -178,6 +181,15 @@ func (c *SessionsController) list(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseSessionListFilter(r)
 	if err != nil {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_QUERY", err.Error(), nil)
+		return
+	}
+	if c.Federation != nil && r.Header.Get("X-AO-Federation-Local") != "1" {
+		sessions, err := c.Federation.List(r.Context(), filter)
+		if err != nil {
+			envelope.WriteError(w, r, err)
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, ListSessionsResponse{Sessions: federatedSessionViews(sessions)})
 		return
 	}
 	sessions, err := c.Svc.List(r.Context(), filter)
@@ -1421,6 +1433,34 @@ func sessionViews(sessions []domain.Session) []SessionView {
 	out := make([]SessionView, 0, len(sessions))
 	for _, s := range sessions {
 		out = append(out, sessionView(s))
+	}
+	return out
+}
+
+func federatedSessionViews(sessions []federationsvc.ListedSession) []SessionView {
+	out := make([]SessionView, 0, len(sessions))
+	for _, listed := range sessions {
+		if listed.Local != nil {
+			out = append(out, sessionView(*listed.Local))
+			continue
+		}
+		if listed.Remote == nil {
+			continue
+		}
+		var view SessionView
+		if err := json.Unmarshal(listed.Remote.View, &view); err != nil {
+			slog.Default().Error("decode remote session view failed", "hostId", listed.Remote.HostID, "err", err)
+			continue
+		}
+		view.ID = domain.QualifySessionID(listed.Remote.HostID, listed.Remote.SessionID)
+		view.HostID = string(listed.Remote.HostID)
+		if listed.Remote.Available {
+			view.Availability = "available"
+		} else {
+			view.Availability = "unavailable"
+			view.UnavailableReason = listed.Remote.UnavailableReason
+		}
+		out = append(out, view)
 	}
 	return out
 }

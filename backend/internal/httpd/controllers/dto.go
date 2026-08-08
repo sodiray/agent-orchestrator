@@ -155,7 +155,13 @@ type WorkspaceFileQuery struct {
 // fields are json:"-"; these curated fields are what serialize.
 type SessionView struct {
 	domain.Session
-	Branch string `json:"branch,omitempty"`
+	// HostID is set only for a session owned by a registered remote daemon.
+	HostID string `json:"hostId,omitempty"`
+	// Availability describes whether the owning remote daemon supplied this
+	// read model during the current list request.
+	Availability      string `json:"availability,omitempty" enum:"available,unavailable"`
+	UnavailableReason string `json:"unavailableReason,omitempty"`
+	Branch            string `json:"branch,omitempty"`
 	// PreviewURL is the browser preview target the desktop app opens for this
 	// session, set via POST /sessions/{sessionId}/preview. Empty (omitted) when
 	// no preview has been requested. Pulled from the json:"-" domain Metadata.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -61,6 +62,7 @@ type Service struct {
 	prober ports.RemoteDaemonProber
 	clock  func() time.Time
 	log    *slog.Logger
+	count  atomic.Int64
 }
 
 var _ Manager = (*Service)(nil)
@@ -75,6 +77,24 @@ func New(deps Deps) *Service {
 		log = slog.Default()
 	}
 	return &Service{store: deps.Store, prober: deps.Prober, clock: clock, log: log}
+}
+
+// LoadPresence initializes the in-memory registered-host count during daemon
+// startup. The federation list uses it to leave the local-only request path
+// completely free of registry reads.
+func (s *Service) LoadPresence(ctx context.Context) error {
+	hosts, err := s.store.ListRemoteHosts(ctx)
+	if err != nil {
+		s.log.Error("load remote host presence failed", "err", err)
+		return err
+	}
+	s.count.Store(int64(len(hosts)))
+	return nil
+}
+
+// HasRegisteredHosts reports whether federation needs to read the registry.
+func (s *Service) HasRegisteredHosts() bool {
+	return s.count.Load() > 0
 }
 
 func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) {
@@ -108,6 +128,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) 
 	if !created {
 		return Host{}, apierr.Conflict("REMOTE_HOST_ALREADY_REGISTERED", "A remote host with this id is already registered", nil)
 	}
+	s.count.Add(1)
 	return s.probe(ctx, host)
 }
 
@@ -188,6 +209,11 @@ func (s *Service) Deregister(ctx context.Context, id domain.RemoteHostID) error 
 	}
 	if !deleted {
 		return apierr.NotFound("REMOTE_HOST_NOT_FOUND", "Unknown remote host")
+	}
+	for current := s.count.Load(); current > 0; current = s.count.Load() {
+		if s.count.CompareAndSwap(current, current-1) {
+			break
+		}
 	}
 	return nil
 }

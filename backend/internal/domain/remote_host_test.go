@@ -37,3 +37,31 @@ func TestValidateRemoteHostAddress(t *testing.T) {
 		}
 	}
 }
+
+func TestQualifiedSessionIDRoundTrip(t *testing.T) {
+	qualified := QualifySessionID("build-host", "project-42")
+	if qualified != "build-host~project-42" {
+		t.Fatalf("qualified = %q", qualified)
+	}
+	parsed, ok := ParseQualifiedSessionID(qualified)
+	if !ok {
+		t.Fatal("ParseQualifiedSessionID() = false")
+	}
+	if parsed.HostID != "build-host" || parsed.SessionID != "project-42" {
+		t.Fatalf("parsed = %#v", parsed)
+	}
+}
+
+func TestParseQualifiedSessionIDRejectsNonQualifiedIDs(t *testing.T) {
+	for _, id := range []SessionID{
+		"project-42",
+		"~project-42",
+		"Build-host~project-42",
+		"build-host~",
+		"build-host~project~42",
+	} {
+		if _, ok := ParseQualifiedSessionID(id); ok {
+			t.Errorf("ParseQualifiedSessionID(%q) = true", id)
+		}
+	}
+}

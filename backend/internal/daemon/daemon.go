@@ -39,6 +39,7 @@ import (
 	browsersvc "github.com/aoagents/agent-orchestrator/backend/internal/service/browser"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 	devimportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/devimport"
+	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 	importsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/importer"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
@@ -252,6 +253,16 @@ func Run() error {
 	lcStack.LCM.SetCompletionTerminator(sessMgr)
 	projectSvc := projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink})
 	remoteHostSvc := remotehostsvc.New(remotehostsvc.Deps{Store: store, Prober: remotedaemon.NewHTTPProber(nil, 0), Logger: log})
+	if err := remoteHostSvc.LoadPresence(ctx); err != nil {
+		return fmt.Errorf("load remote host presence: %w", err)
+	}
+	federationSvc := federationsvc.New(federationsvc.Deps{
+		Local:    sessionSvc,
+		Store:    store,
+		Presence: remoteHostSvc,
+		Client:   remotedaemon.NewHTTPSessionLister(nil, 0),
+		Logger:   log,
+	})
 	go remoteHostSvc.RunHealthProbes(ctx, remotehostsvc.DefaultProbeInterval)
 	if err := seedScratchProjectOnBoot(ctx, cfg, projectSvc); err != nil {
 		stop()
@@ -360,6 +371,7 @@ func Run() error {
 	srv, err := httpd.NewWithDeps(cfg, log, termMgr, httpd.APIDeps{
 		Projects:           projectSvc,
 		RemoteHosts:        remoteHostSvc,
+		Federation:         federationSvc,
 		Agents:             agentSvc,
 		Sessions:           sessionSvc,
 		PRs:                prActions,

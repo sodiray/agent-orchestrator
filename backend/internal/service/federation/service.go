@@ -1,0 +1,209 @@
+// Package federation aggregates sessions owned by registered remote daemons
+// while preserving each owner's read model and display status.
+package federation
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+)
+
+const DefaultListTimeout = 2 * time.Second
+
+type LocalSessions interface {
+	List(ctx context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error)
+}
+
+type RemoteHostStore interface {
+	ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error)
+	GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error)
+	ReplaceRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot) error
+	ListRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID) ([]domain.RemoteSessionSnapshot, error)
+}
+
+// HostPresence keeps the local-only session-list path free of even a registry
+// read when no remote host has been registered.
+type HostPresence interface {
+	HasRegisteredHosts() bool
+}
+
+type Deps struct {
+	Local    LocalSessions
+	Store    RemoteHostStore
+	Presence HostPresence
+	Client   ports.RemoteDaemonSessionLister
+	Timeout  time.Duration
+	Clock    func() time.Time
+	Logger   *slog.Logger
+}
+
+type Service struct {
+	local    LocalSessions
+	store    RemoteHostStore
+	presence HostPresence
+	client   ports.RemoteDaemonSessionLister
+	timeout  time.Duration
+	clock    func() time.Time
+	log      *slog.Logger
+}
+
+type ListedSession struct {
+	Local  *domain.Session
+	Remote *RemoteSession
+}
+
+type RemoteSession struct {
+	HostID            domain.RemoteHostID
+	SessionID         domain.SessionID
+	View              []byte
+	Available         bool
+	UnavailableReason string
+}
+
+func New(deps Deps) *Service {
+	timeout := deps.Timeout
+	if timeout <= 0 {
+		timeout = DefaultListTimeout
+	}
+	clock := deps.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	log := deps.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Service{
+		local:    deps.Local,
+		store:    deps.Store,
+		presence: deps.Presence,
+		client:   deps.Client,
+		timeout:  timeout,
+		clock:    clock,
+		log:      log,
+	}
+}
+
+// List returns local sessions unchanged and adds remote sessions using their
+// owner's view. A remote-host failure becomes unavailable session entries from
+// the durable last-known snapshots; it never fails the local board.
+func (s *Service) List(ctx context.Context, filter sessionsvc.ListFilter) ([]ListedSession, error) {
+	local, err := s.local.List(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	out := localListedSessions(local)
+	if s.presence == nil || !s.presence.HasRegisteredHosts() {
+		return out, nil
+	}
+	hosts, err := s.store.ListRemoteHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list registered remote hosts: %w", err)
+	}
+	remote := make([][]ListedSession, len(hosts))
+	var group sync.WaitGroup
+	for index, host := range hosts {
+		group.Add(1)
+		go func(index int, host domain.RemoteHost) {
+			defer group.Done()
+			remote[index] = s.listHost(ctx, host, filter)
+		}(index, host)
+	}
+	group.Wait()
+	for _, sessions := range remote {
+		out = append(out, sessions...)
+	}
+	return out, nil
+}
+
+func (s *Service) Resolve(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error) {
+	return s.store.GetRemoteHost(ctx, id)
+}
+
+func (s *Service) listHost(ctx context.Context, host domain.RemoteHost, filter sessionsvc.ListFilter) []ListedSession {
+	if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
+		reason := fmt.Sprintf("remote host is %s", host.OperatorState)
+		s.log.Warn("remote session list unavailable", "hostId", host.HostID, "reason", reason)
+		return s.unavailableSnapshots(ctx, host, reason)
+	}
+	if s.client == nil {
+		reason := "remote session client is unavailable"
+		s.log.Error("remote session list unavailable", "hostId", host.HostID, "reason", reason)
+		return s.unavailableSnapshots(ctx, host, reason)
+	}
+	listCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	snapshots, err := s.client.ListSessions(listCtx, host.Address, remoteSessionFilter(filter))
+	if err != nil {
+		reason := err.Error()
+		s.log.Warn("remote session list failed", "hostId", host.HostID, "address", host.Address, "err", err)
+		return s.unavailableSnapshots(ctx, host, reason)
+	}
+	observedAt := s.clock().UTC()
+	for index := range snapshots {
+		snapshots[index].HostID = host.HostID
+		snapshots[index].ObservedAt = observedAt
+	}
+	if err := s.store.ReplaceRemoteSessionSnapshots(ctx, host.HostID, snapshots); err != nil {
+		s.log.Error("store remote session snapshots failed", "hostId", host.HostID, "err", err)
+	}
+	return availableSnapshots(host.HostID, snapshots)
+}
+
+func (s *Service) unavailableSnapshots(ctx context.Context, host domain.RemoteHost, reason string) []ListedSession {
+	snapshots, err := s.store.ListRemoteSessionSnapshots(ctx, host.HostID)
+	if err != nil {
+		s.log.Error("load unavailable remote session snapshots failed", "hostId", host.HostID, "err", err)
+		return nil
+	}
+	return unavailableSnapshotSessions(host.HostID, snapshots, reason)
+}
+
+func localListedSessions(sessions []domain.Session) []ListedSession {
+	out := make([]ListedSession, 0, len(sessions))
+	for index := range sessions {
+		out = append(out, ListedSession{Local: &sessions[index]})
+	}
+	return out
+}
+
+func availableSnapshots(hostID domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot) []ListedSession {
+	out := make([]ListedSession, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		out = append(out, ListedSession{Remote: &RemoteSession{
+			HostID:    hostID,
+			SessionID: snapshot.SessionID,
+			View:      snapshot.View,
+			Available: true,
+		}})
+	}
+	return out
+}
+
+func unavailableSnapshotSessions(hostID domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot, reason string) []ListedSession {
+	out := make([]ListedSession, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		out = append(out, ListedSession{Remote: &RemoteSession{
+			HostID:            hostID,
+			SessionID:         snapshot.SessionID,
+			View:              snapshot.View,
+			UnavailableReason: reason,
+		}})
+	}
+	return out
+}
+
+func remoteSessionFilter(filter sessionsvc.ListFilter) ports.RemoteSessionListFilter {
+	return ports.RemoteSessionListFilter{
+		Project:          filter.ProjectID,
+		Active:           filter.Active,
+		OrchestratorOnly: filter.OrchestratorOnly,
+		Fresh:            filter.Fresh,
+	}
+}

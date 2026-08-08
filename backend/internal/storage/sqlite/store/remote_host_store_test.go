@@ -46,3 +46,33 @@ func TestRemoteHostRoundTrip(t *testing.T) {
 		t.Fatalf("failed probe round trip = %+v, found=%v err=%v", got, found, err)
 	}
 }
+
+func TestRemoteSessionSnapshotsRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 8, 7, 1, 2, 3, 0, time.UTC)
+	host := domain.RemoteHost{
+		HostID:             "lab-host",
+		Address:            "127.0.0.1:3001",
+		LastProbeAt:        now,
+		LastProbeSucceeded: true,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if created, err := s.CreateRemoteHost(context.Background(), host); err != nil || !created {
+		t.Fatalf("create remote host: created=%v err=%v", created, err)
+	}
+	if err := s.ReplaceRemoteSessionSnapshots(context.Background(), host.HostID, []domain.RemoteSessionSnapshot{{
+		SessionID:  "project-7",
+		View:       []byte(`{"id":"project-7","status":"idle"}`),
+		ObservedAt: now,
+	}}); err != nil {
+		t.Fatalf("replace remote session snapshots: %v", err)
+	}
+	snapshots, err := s.ListRemoteSessionSnapshots(context.Background(), host.HostID)
+	if err != nil {
+		t.Fatalf("list remote session snapshots: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].SessionID != "project-7" || string(snapshots[0].View) != `{"id":"project-7","status":"idle"}` {
+		t.Fatalf("snapshots = %#v", snapshots)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	remotehostsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/remotehost"
@@ -23,6 +24,7 @@ type APIDeps struct {
 	Agents             controllers.AgentCatalog
 	Projects           projectsvc.Manager
 	RemoteHosts        remotehostsvc.Manager
+	Federation         *federationsvc.Service
 	Sessions           controllers.SessionService
 	Activity           controllers.ActivityRecorder
 	UsageHooks         controllers.UsageHookRecorder
@@ -56,6 +58,7 @@ type API struct {
 	agents        *controllers.AgentsController
 	projects      *controllers.ProjectsController
 	remoteHosts   *controllers.RemoteHostsController
+	federation    *federationsvc.Service
 	sessions      *controllers.SessionsController
 	usage         *controllers.UsageController
 	prs           *controllers.PRsController
@@ -84,12 +87,14 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 			Mgr: deps.Projects,
 		},
 		remoteHosts: &controllers.RemoteHostsController{Mgr: deps.RemoteHosts},
+		federation:  deps.Federation,
 		sessions: &controllers.SessionsController{
 			Svc:           deps.Sessions,
 			Activity:      deps.Activity,
 			Usage:         deps.UsageHooks,
 			PreviewServer: deps.PreviewServer,
 			Capabilities:  deps.SessionCapabilities,
+			Federation:    deps.Federation,
 		},
 		usage:         &controllers.UsageController{Svc: deps.UsageSummary},
 		prs:           &controllers.PRsController{Svc: deps.PRs},
@@ -115,6 +120,9 @@ func (a *API) Register(root chi.Router) {
 	}
 
 	root.Route("/api/v1", func(r chi.Router) {
+		if a.federation != nil {
+			r.Use(newSessionProxy(a.federation).Middleware)
+		}
 		// Serve the OpenAPI document from the same origin as the routes it describes.
 		r.Get("/openapi.yaml", apispec.ServeYAML)
 

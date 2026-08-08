@@ -121,6 +121,56 @@ func (s *Store) DeleteRemoteHost(ctx context.Context, id domain.RemoteHostID) (b
 	return affected > 0, nil
 }
 
+func (s *Store) ReplaceRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.writeDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin replace remote session snapshots for %s: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM remote_session_snapshots WHERE host_id = ?`, id); err != nil {
+		return fmt.Errorf("clear remote session snapshots for %s: %w", id, err)
+	}
+	for _, snapshot := range snapshots {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO remote_session_snapshots (host_id, session_id, view_json, observed_at)
+VALUES (?, ?, ?, ?)`, id, snapshot.SessionID, string(snapshot.View), snapshot.ObservedAt); err != nil {
+			return fmt.Errorf("insert remote session snapshot %s/%s: %w", id, snapshot.SessionID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit remote session snapshots for %s: %w", id, err)
+	}
+	return nil
+}
+
+func (s *Store) ListRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID) ([]domain.RemoteSessionSnapshot, error) {
+	rows, err := s.readDB.QueryContext(ctx, `
+SELECT host_id, session_id, view_json, observed_at
+FROM remote_session_snapshots
+WHERE host_id = ?
+ORDER BY session_id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("list remote session snapshots for %s: %w", id, err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []domain.RemoteSessionSnapshot{}
+	for rows.Next() {
+		var snapshot domain.RemoteSessionSnapshot
+		var view string
+		if err := rows.Scan(&snapshot.HostID, &snapshot.SessionID, &view, &snapshot.ObservedAt); err != nil {
+			return nil, fmt.Errorf("scan remote session snapshot: %w", err)
+		}
+		snapshot.View = []byte(view)
+		out = append(out, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate remote session snapshots for %s: %w", id, err)
+	}
+	return out, nil
+}
+
 type remoteHostScanner interface {
 	Scan(dest ...any) error
 }

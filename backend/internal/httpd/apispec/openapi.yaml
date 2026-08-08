@@ -4706,6 +4706,11 @@ components:
       properties:
         activity:
           $ref: '#/components/schemas/DomainActivity'
+        availability:
+          enum:
+          - available
+          - unavailable
+          type: string
         branch:
           type: string
         createdAt:
@@ -4714,6 +4719,8 @@ components:
         displayName:
           type: string
         harness:
+          type: string
+        hostId:
           type: string
         id:
           type: string
@@ -4805,6 +4812,8 @@ components:
           type: string
         terminateOnPrMerge:
           type: boolean
+        unavailableReason:
+          type: string
         updatedAt:
           format: date-time
           type: string

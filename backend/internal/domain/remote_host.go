@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"regexp"
@@ -10,6 +11,8 @@ import (
 )
 
 const maxRemoteHostIDLength = 63
+
+const qualifiedSessionSeparator = "~"
 
 var remoteHostIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
@@ -34,6 +37,42 @@ type RemoteHost struct {
 	LastProbeError     string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+}
+
+// QualifiedSessionID identifies a session that is owned by a registered remote
+// daemon. Local session IDs intentionally remain bare.
+type QualifiedSessionID struct {
+	HostID    RemoteHostID
+	SessionID SessionID
+}
+
+// QualifySessionID formats a remote session identity for the local API.
+func QualifySessionID(hostID RemoteHostID, sessionID SessionID) SessionID {
+	return SessionID(string(hostID) + qualifiedSessionSeparator + string(sessionID))
+}
+
+// ParseQualifiedSessionID recognizes the remote-only hostId~sessionId form.
+// Any ID that does not meet this exact form is local by definition.
+func ParseQualifiedSessionID(id SessionID) (QualifiedSessionID, bool) {
+	parts := strings.Split(string(id), qualifiedSessionSeparator)
+	if len(parts) != 2 || parts[1] == "" || strings.Contains(parts[1], qualifiedSessionSeparator) {
+		return QualifiedSessionID{}, false
+	}
+	hostID := RemoteHostID(parts[0])
+	if ValidateRemoteHostID(hostID) != nil {
+		return QualifiedSessionID{}, false
+	}
+	return QualifiedSessionID{HostID: hostID, SessionID: SessionID(parts[1])}, true
+}
+
+// RemoteSessionSnapshot is the last read model received from a remote daemon.
+// View retains its owning daemon's wire representation verbatim so a local
+// daemon never derives display state for a remote session.
+type RemoteSessionSnapshot struct {
+	HostID     RemoteHostID
+	SessionID  SessionID
+	View       json.RawMessage
+	ObservedAt time.Time
 }
 
 func ValidateRemoteHostID(id RemoteHostID) error {
