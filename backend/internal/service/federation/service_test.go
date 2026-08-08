@@ -9,6 +9,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
 
@@ -16,6 +17,26 @@ type fakeLocalSessions struct{ sessions []domain.Session }
 
 func (f fakeLocalSessions) List(context.Context, sessionsvc.ListFilter) ([]domain.Session, error) {
 	return f.sessions, nil
+}
+
+type fakeLocalNotifications struct {
+	page  notificationsvc.ListPage
+	calls int
+}
+
+func (f *fakeLocalNotifications) List(context.Context, notificationsvc.ListFilter) (notificationsvc.ListPage, error) {
+	f.calls++
+	return f.page, nil
+}
+
+type fakeNotificationClient struct {
+	list  func(context.Context, string, domain.NotificationListStatus, int, string) (ports.RemoteNotificationListPage, error)
+	calls int
+}
+
+func (f *fakeNotificationClient) ListNotifications(ctx context.Context, address string, status domain.NotificationListStatus, limit int, cursor string) (ports.RemoteNotificationListPage, error) {
+	f.calls++
+	return f.list(ctx, address, status, limit, cursor)
 }
 
 type fakePresence struct{ hasHosts bool }
@@ -191,5 +212,63 @@ func TestListUsesPerHostTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
 		t.Fatalf("List() took %s", elapsed)
+	}
+}
+
+func TestListNotificationsAddsReachableRemoteNotifications(t *testing.T) {
+	now := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
+	host := domain.RemoteHost{HostID: "workstation", Address: "127.0.0.1:3001"}
+	local := &fakeLocalNotifications{page: notificationsvc.ListPage{Notifications: []notificationsvc.Notification{{
+		NotificationRecord: domain.NotificationRecord{ID: "local", SessionID: "local-1", ProjectID: "local", Type: domain.NotificationNeedsInput, Title: "local", Status: domain.NotificationUnread, CreatedAt: now},
+		Target:             notificationsvc.Target{Kind: notificationsvc.TargetSession, SessionID: "local-1"},
+	}}, UnreadCount: 1, UnresolvedCount: 1}}
+	client := &fakeNotificationClient{list: func(_ context.Context, address string, _ domain.NotificationListStatus, _ int, _ string) (ports.RemoteNotificationListPage, error) {
+		if address != host.Address {
+			t.Fatalf("address = %q", address)
+		}
+		return ports.RemoteNotificationListPage{Notifications: []domain.NotificationRecord{{ID: "ntf_7", SessionID: "remote-7", ProjectID: "remote", Type: domain.NotificationNeedsInput, Title: "remote", Status: domain.NotificationUnread, CreatedAt: now.Add(time.Second)}}, UnreadCount: 1, UnresolvedCount: 1}, nil
+	}}
+	svc := New(Deps{Store: &fakeStore{hosts: []domain.RemoteHost{host}}, Presence: fakePresence{hasHosts: true}, Notifications: local, NotificationClient: client})
+	page, err := svc.ListNotifications(context.Background(), notificationsvc.ListFilter{Status: notificationsvc.ListUnread, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListNotifications() error = %v", err)
+	}
+	if len(page.Notifications) != 2 || page.Notifications[0].ID != "workstation~ntf_7" || page.Notifications[0].SessionID != "workstation~remote-7" || page.Notifications[0].Target.SessionID != "workstation~remote-7" {
+		t.Fatalf("notifications = %#v", page.Notifications)
+	}
+	if page.UnreadCount != 2 || page.UnresolvedCount != 2 || len(page.RemoteFailures) != 0 {
+		t.Fatalf("page = %#v", page)
+	}
+}
+
+func TestListNotificationsSurfacesUnreachableHostReason(t *testing.T) {
+	host := domain.RemoteHost{HostID: "dead-host", Address: "dead:3001"}
+	local := &fakeLocalNotifications{page: notificationsvc.ListPage{UnreadCount: 1}}
+	client := &fakeNotificationClient{list: func(context.Context, string, domain.NotificationListStatus, int, string) (ports.RemoteNotificationListPage, error) {
+		return ports.RemoteNotificationListPage{}, errors.New("connection refused")
+	}}
+	svc := New(Deps{Store: &fakeStore{hosts: []domain.RemoteHost{host}}, Presence: fakePresence{hasHosts: true}, Notifications: local, NotificationClient: client})
+	page, err := svc.ListNotifications(context.Background(), notificationsvc.ListFilter{Status: notificationsvc.ListUnread, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListNotifications() error = %v", err)
+	}
+	if len(page.RemoteFailures) != 1 || page.RemoteFailures[0].HostID != host.HostID || page.RemoteFailures[0].Reason != "connection refused" || page.UnreadCount != 1 {
+		t.Fatalf("page = %#v", page)
+	}
+}
+
+func TestListNotificationsWithoutRemoteHostsDoesNoRemoteWork(t *testing.T) {
+	store := &fakeStore{}
+	local := &fakeLocalNotifications{page: notificationsvc.ListPage{UnreadCount: 1}}
+	client := &fakeNotificationClient{list: func(context.Context, string, domain.NotificationListStatus, int, string) (ports.RemoteNotificationListPage, error) {
+		t.Fatal("remote notification client must not be called")
+		return ports.RemoteNotificationListPage{}, nil
+	}}
+	svc := New(Deps{Store: store, Presence: fakePresence{}, Notifications: local, NotificationClient: client})
+	if _, err := svc.ListNotifications(context.Background(), notificationsvc.ListFilter{Status: notificationsvc.ListUnread, Limit: 100}); err != nil {
+		t.Fatalf("ListNotifications() error = %v", err)
+	}
+	if store.listHostsCalls != 0 || client.calls != 0 || local.calls != 1 {
+		t.Fatalf("store calls=%d client calls=%d local calls=%d", store.listHostsCalls, client.calls, local.calls)
 	}
 }

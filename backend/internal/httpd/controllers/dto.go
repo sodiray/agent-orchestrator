@@ -931,10 +931,18 @@ type NotificationResponse struct {
 
 // ListNotificationsResponse is one history page from GET /api/v1/notifications.
 type ListNotificationsResponse struct {
-	Notifications   []NotificationResponse `json:"notifications"`
-	NextCursor      string                 `json:"nextCursor,omitempty"`
-	UnreadCount     int                    `json:"unreadCount"`
-	UnresolvedCount int                    `json:"unresolvedCount"`
+	Notifications   []NotificationResponse      `json:"notifications"`
+	NextCursor      string                      `json:"nextCursor,omitempty"`
+	UnreadCount     int                         `json:"unreadCount"`
+	UnresolvedCount int                         `json:"unresolvedCount"`
+	RemoteFailures  []RemoteNotificationFailure `json:"remoteFailures,omitempty" description:"Registered remote hosts whose notifications could not be read. The list is partial; each reason must be shown to the operator."`
+}
+
+// RemoteNotificationFailure explains why a registered host's notifications
+// are absent from an otherwise usable federated list.
+type RemoteNotificationFailure struct {
+	HostID string `json:"hostId"`
+	Reason string `json:"reason"`
 }
 
 // MarkNotificationReadRequest is the body of PATCH /api/v1/notifications/{id}.

@@ -63,4 +63,24 @@ func TestHTTPSessionListerReadsNativeSessionViews(t *testing.T) {
 	}
 }
 
+func TestHTTPSessionListerReadsNativeNotifications(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/notifications" || r.URL.Query().Get("status") != "unread" || r.URL.Query().Get("limit") != "10" {
+			t.Errorf("request = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		if r.Header.Get("X-AO-Federation-Local") != "1" {
+			t.Errorf("federation header = %q", r.Header.Get("X-AO-Federation-Local"))
+		}
+		_, _ = w.Write([]byte(`{"notifications":[{"id":"ntf_7","sessionId":"project-7","projectId":"project","prUrl":"","type":"needs_input","title":"input","body":"","status":"unread","createdAt":"2026-08-08T10:00:00Z"}],"unreadCount":1,"unresolvedCount":1}`))
+	}))
+	t.Cleanup(srv.Close)
+	page, err := NewHTTPSessionLister(nil, 0).ListNotifications(context.Background(), strings.TrimPrefix(srv.URL, "http://"), domain.NotificationListUnread, 10, "")
+	if err != nil {
+		t.Fatalf("ListNotifications() error = %v", err)
+	}
+	if len(page.Notifications) != 1 || page.Notifications[0].ID != "ntf_7" || page.Notifications[0].SessionID != "project-7" || page.UnreadCount != 1 {
+		t.Fatalf("page = %#v", page)
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }

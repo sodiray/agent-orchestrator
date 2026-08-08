@@ -72,12 +72,17 @@ type API struct {
 	dev           *controllers.DevController
 	browser       *controllers.BrowserController
 	events        *EventsController
+	proxy         *sessionProxy
 }
 
 // NewAPI constructs the API surface from its dependencies. cfg carries the
 // per-request timeout so the REST group can apply it without re-reading the
 // environment.
 func NewAPI(cfg config.Config, deps APIDeps) *API {
+	var proxy *sessionProxy
+	if deps.Federation != nil {
+		proxy = newSessionProxy(deps.Federation)
+	}
 	return &API{
 		cfg: cfg,
 		agents: &controllers.AgentsController{
@@ -99,7 +104,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		usage:         &controllers.UsageController{Svc: deps.UsageSummary},
 		prs:           &controllers.PRsController{Svc: deps.PRs},
 		reviews:       &controllers.ReviewsController{Svc: deps.Reviews},
-		notifications: &controllers.NotificationsController{Svc: deps.Notifications, Stream: deps.NotificationStream},
+		notifications: &controllers.NotificationsController{Svc: deps.Notifications, Stream: newFederatedNotificationStream(deps.NotificationStream, deps.Federation), LocalStream: deps.NotificationStream, Federation: deps.Federation, RemoteMutator: proxy},
 		push:          &controllers.PushController{Registry: deps.Push},
 		imports:       &controllers.ImportController{Svc: deps.Import},
 		shellTerms:    &controllers.ShellTerminalsController{Svc: deps.ShellTerminals},
@@ -108,6 +113,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		dev:           &controllers.DevController{Import: deps.DevImport},
 		browser:       &controllers.BrowserController{Svc: deps.Browser},
 		events:        &EventsController{Source: deps.CDC, Live: deps.Events, Federation: deps.Federation},
+		proxy:         proxy,
 	}
 }
 
@@ -120,8 +126,8 @@ func (a *API) Register(root chi.Router) {
 	}
 
 	root.Route("/api/v1", func(r chi.Router) {
-		if a.federation != nil {
-			r.Use(newSessionProxy(a.federation).Middleware)
+		if a.proxy != nil {
+			r.Use(a.proxy.Middleware)
 		}
 		// Serve the OpenAPI document from the same origin as the routes it describes.
 		r.Get("/openapi.yaml", apispec.ServeYAML)

@@ -5690,6 +5690,12 @@ components:
           items:
             $ref: '#/components/schemas/NotificationResponse'
           type: array
+        remoteFailures:
+          description: Registered remote hosts whose notifications could not be read.
+            The list is partial; each reason must be shown to the operator.
+          items:
+            $ref: '#/components/schemas/RemoteNotificationFailure'
+          type: array
         unreadCount:
           type: integer
         unresolvedCount:
@@ -6271,6 +6277,16 @@ components:
           $ref: '#/components/schemas/RemoteHost'
       required:
       - remoteHost
+      type: object
+    RemoteNotificationFailure:
+      properties:
+        hostId:
+          type: string
+        reason:
+          type: string
+      required:
+      - hostId
+      - reason
       type: object
     RemoveProjectResult:
       properties:

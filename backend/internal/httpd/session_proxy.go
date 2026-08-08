@@ -1,6 +1,7 @@
 package httpd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,30 @@ func newRemoteDaemonClient(timeout time.Duration) *http.Client {
 // IDs take the existing handler path without a host-registry read.
 func (p *sessionProxy) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if qualified, ok := qualifiedNotificationFromPath(r.URL.Path); ok {
+			host, found, err := p.federation.Resolve(r.Context(), qualified.HostID)
+			if err != nil {
+				p.log.Error("resolve remote notification host failed", "hostId", qualified.HostID, "err", err)
+				envelope.WriteAPIError(w, r, http.StatusInternalServerError, "internal", "REMOTE_HOST_RESOLUTION_FAILED",
+					"Could not resolve the remote notification host", map[string]any{"hostId": qualified.HostID})
+				return
+			}
+			if !found {
+				p.log.Warn("remote notification proxy host is not registered", "hostId", qualified.HostID)
+				envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "REMOTE_HOST_NOT_FOUND",
+					fmt.Sprintf("Remote host %q is not registered", qualified.HostID), map[string]any{"hostId": qualified.HostID})
+				return
+			}
+			if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
+				reason := fmt.Sprintf("remote host is %s", host.OperatorState)
+				p.log.Warn("remote notification proxy unavailable", "hostId", host.HostID, "reason", reason)
+				envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "REMOTE_HOST_UNAVAILABLE",
+					fmt.Sprintf("Remote host %q is unavailable: %s", host.HostID, reason), map[string]any{"hostId": host.HostID, "reason": reason})
+				return
+			}
+			p.forwardNotification(w, r, host, qualified)
+			return
+		}
 		qualified, ok := qualifiedSessionFromPath(r.URL.Path)
 		if !ok {
 			next.ServeHTTP(w, r)
@@ -103,6 +128,118 @@ func (p *sessionProxy) Middleware(next http.Handler) http.Handler {
 		}
 		p.forward(w, r, host, qualified)
 	})
+}
+
+func (p *sessionProxy) forwardNotification(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedNotificationID) {
+	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
+	defer cancel()
+	target, err := remoteNotificationURL(r.URL, host.Address, qualified.NotificationID)
+	if err != nil {
+		p.writeRemoteUnavailable(w, r, host, "build remote notification proxy target", err)
+		return
+	}
+	req, err := remoteProxyRequest(proxyCtx, r, target)
+	if err != nil {
+		p.writeRemoteUnavailable(w, r, host, "build remote notification proxy request", err)
+		return
+	}
+	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		p.writeRemoteRequestError(w, r, host, "remote notification proxy failed", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if isRedirect(resp.StatusCode) {
+		p.writeRemoteRedirect(w, r, host)
+		return
+	}
+	if err := p.writeQualifiedNotificationResponse(w, resp, qualified); err != nil {
+		p.log.Warn("qualify remote notification response failed", "hostId", host.HostID, "reason", err.Error())
+		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
+			fmt.Sprintf("Remote host %q returned an unqualifiable notification response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+	}
+}
+
+// MarkAllRead forwards each group of qualified notification IDs to its owner.
+// It deliberately shares the session proxy's host resolution, allowlisted HTTP
+// client, and redirect refusal rather than creating a second remote path.
+func (p *sessionProxy) MarkAllRead(ctx context.Context, ids []string) (int64, error) {
+	if p == nil || p.federation == nil || !p.federation.HasRegisteredHosts() {
+		return 0, nil
+	}
+	groups := map[domain.RemoteHostID][]string{}
+	for _, id := range ids {
+		qualified, ok := domain.ParseQualifiedNotificationID(id)
+		if !ok {
+			continue
+		}
+		groups[qualified.HostID] = append(groups[qualified.HostID], qualified.NotificationID)
+	}
+	if len(ids) == 0 {
+		hosts, err := p.federation.RemoteHosts(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("list remote hosts for notification acknowledgement: %w", err)
+		}
+		for _, host := range hosts {
+			groups[host.HostID] = nil
+		}
+	}
+	var updated int64
+	for hostID, notificationIDs := range groups {
+		host, found, err := p.federation.Resolve(ctx, hostID)
+		if err != nil {
+			return 0, fmt.Errorf("resolve remote notification host %q: %w", hostID, err)
+		}
+		if !found {
+			return 0, fmt.Errorf("remote notification host %q is not registered", hostID)
+		}
+		if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
+			return 0, fmt.Errorf("remote notification host %q is %s", hostID, host.OperatorState)
+		}
+		count, err := p.markRemoteHostNotificationsRead(ctx, host, notificationIDs)
+		if err != nil {
+			return 0, err
+		}
+		updated += count
+	}
+	return updated, nil
+}
+
+func (p *sessionProxy) markRemoteHostNotificationsRead(ctx context.Context, host domain.RemoteHost, ids []string) (int64, error) {
+	body, err := json.Marshal(map[string][]string{"ids": ids})
+	if err != nil {
+		return 0, fmt.Errorf("encode remote notification acknowledgement: %w", err)
+	}
+	proxyCtx, cancel := context.WithTimeout(ctx, remoteSessionProxyTimeout)
+	defer cancel()
+	target := &url.URL{Scheme: "http", Host: host.Address, Path: "/api/v1/notifications/read-all"}
+	source, err := http.NewRequestWithContext(proxyCtx, http.MethodPost, target.String(), bytes.NewReader(body)) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		return 0, fmt.Errorf("build remote notification acknowledgement: %w", err)
+	}
+	source.Header.Set("Content-Type", "application/json")
+	req, err := remoteProxyRequest(proxyCtx, source, target)
+	if err != nil {
+		return 0, fmt.Errorf("build remote notification acknowledgement proxy request: %w", err)
+	}
+	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		return 0, fmt.Errorf("request remote notification acknowledgement for %q: %w", host.HostID, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if isRedirect(resp.StatusCode) {
+		return 0, errRemoteRedirect
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, fmt.Errorf("remote notification acknowledgement for %q returned HTTP %d", host.HostID, resp.StatusCode)
+	}
+	var response struct {
+		UpdatedCount int64 `json:"updatedCount"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRemoteJSONResponseSize)).Decode(&response); err != nil {
+		return 0, fmt.Errorf("decode remote notification acknowledgement for %q: %w", host.HostID, err)
+	}
+	return response.UpdatedCount, nil
 }
 
 // forwardStream keeps the owning daemon's workspace watcher open for the
@@ -213,6 +350,37 @@ func (p *sessionProxy) writeQualifiedResponse(w http.ResponseWriter, r *http.Req
 	return nil
 }
 
+func (p *sessionProxy) writeQualifiedNotificationResponse(w http.ResponseWriter, resp *http.Response, qualified domain.QualifiedNotificationID) error {
+	if !isJSONResponse(resp.Header) || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		copyRemoteResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, err := io.Copy(w, resp.Body)
+		return err
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteJSONResponseSize+1))
+	if err != nil {
+		return fmt.Errorf("read JSON response: %w", err)
+	}
+	if len(body) > maxRemoteJSONResponseSize {
+		return fmt.Errorf("JSON response exceeds %d bytes", maxRemoteJSONResponseSize)
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("decode JSON response: %w", err)
+	}
+	if err := qualifyRemoteNotificationResponse(payload, qualified.HostID, qualified.NotificationID); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode qualified JSON response: %w", err)
+	}
+	copyRemoteResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(encoded)
+	return err
+}
+
 func (p *sessionProxy) writeRemoteUnavailable(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, operation string, err error) {
 	p.log.Error(operation, "hostId", host.HostID, "err", err)
 	envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_UNREACHABLE",
@@ -243,6 +411,18 @@ func qualifiedSessionFromPath(requestPath string) (domain.QualifiedSessionID, bo
 	return domain.ParseQualifiedSessionID(domain.SessionID(id))
 }
 
+func qualifiedNotificationFromPath(requestPath string) (domain.QualifiedNotificationID, bool) {
+	prefix := "/api/v1/notifications/"
+	if !strings.HasPrefix(requestPath, prefix) {
+		return domain.QualifiedNotificationID{}, false
+	}
+	id, suffix, _ := strings.Cut(strings.TrimPrefix(requestPath, prefix), "/")
+	if id == "" || suffix != "" {
+		return domain.QualifiedNotificationID{}, false
+	}
+	return domain.ParseQualifiedNotificationID(id)
+}
+
 func isRemoteSessionStream(requestPath string) bool {
 	return strings.HasSuffix(strings.TrimSuffix(requestPath, "/"), "/workspace/events")
 }
@@ -259,6 +439,14 @@ func remoteSessionURL(in *url.URL, address string, sessionID domain.SessionID) (
 		path += "/" + suffix
 	}
 	return &url.URL{Scheme: "http", Host: address, Path: path, RawQuery: in.RawQuery}, nil
+}
+
+func remoteNotificationURL(in *url.URL, address string, notificationID string) (*url.URL, error) {
+	prefix := "/api/v1/notifications/"
+	if !strings.HasPrefix(in.Path, prefix) || strings.Contains(strings.TrimPrefix(in.Path, prefix), "/") {
+		return nil, fmt.Errorf("request is not a notification-bearing route")
+	}
+	return &url.URL{Scheme: "http", Host: address, Path: prefix + url.PathEscape(notificationID), RawQuery: in.RawQuery}, nil
 }
 
 func remoteSessionRoute(requestPath string) (string, string, bool) {
@@ -413,4 +601,53 @@ func qualifyRemoteSessionReferenceList(hostID domain.RemoteHostID, key string, v
 		qualified = append(qualified, value)
 	}
 	return qualified, nil
+}
+
+func qualifyRemoteNotificationResponse(value any, hostID domain.RemoteHostID, ownerNotificationID string) error {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("notification response is not an object")
+	}
+	if notification, ok := root["notification"]; ok {
+		return qualifyRemoteNotificationObject(notification, hostID, ownerNotificationID)
+	}
+	if notifications, ok := root["notifications"].([]any); ok {
+		for _, notification := range notifications {
+			if err := qualifyRemoteNotificationObject(notification, hostID, ownerNotificationID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func qualifyRemoteNotificationObject(value any, hostID domain.RemoteHostID, ownerNotificationID string) error {
+	notification, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("notification is not an object")
+	}
+	id, ok := notification["id"].(string)
+	if !ok || id == "" || id != ownerNotificationID {
+		return fmt.Errorf("notification id is invalid")
+	}
+	notification["id"] = domain.QualifyNotificationID(hostID, id)
+	for _, key := range []string{"sessionId"} {
+		if raw, ok := notification[key].(string); ok && raw != "" {
+			qualified, err := domain.QualifyRemoteSessionID(hostID, domain.SessionID(raw))
+			if err != nil {
+				return err
+			}
+			notification[key] = string(qualified)
+		}
+	}
+	if target, ok := notification["target"].(map[string]any); ok {
+		if raw, ok := target["sessionId"].(string); ok && raw != "" {
+			qualified, err := domain.QualifyRemoteSessionID(hostID, domain.SessionID(raw))
+			if err != nil {
+				return err
+			}
+			target["sessionId"] = string(qualified)
+		}
+	}
+	return nil
 }

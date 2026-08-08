@@ -6,11 +6,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
 
@@ -18,6 +20,10 @@ const DefaultListTimeout = 2 * time.Second
 
 type LocalSessions interface {
 	List(ctx context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error)
+}
+
+type LocalNotifications interface {
+	List(ctx context.Context, filter notificationsvc.ListFilter) (notificationsvc.ListPage, error)
 }
 
 type RemoteHostStore interface {
@@ -34,23 +40,27 @@ type HostPresence interface {
 }
 
 type Deps struct {
-	Local    LocalSessions
-	Store    RemoteHostStore
-	Presence HostPresence
-	Client   ports.RemoteDaemonSessionLister
-	Timeout  time.Duration
-	Clock    func() time.Time
-	Logger   *slog.Logger
+	Local              LocalSessions
+	Store              RemoteHostStore
+	Presence           HostPresence
+	Client             ports.RemoteDaemonSessionLister
+	Notifications      LocalNotifications
+	NotificationClient ports.RemoteDaemonNotificationLister
+	Timeout            time.Duration
+	Clock              func() time.Time
+	Logger             *slog.Logger
 }
 
 type Service struct {
-	local    LocalSessions
-	store    RemoteHostStore
-	presence HostPresence
-	client   ports.RemoteDaemonSessionLister
-	timeout  time.Duration
-	clock    func() time.Time
-	log      *slog.Logger
+	local              LocalSessions
+	store              RemoteHostStore
+	presence           HostPresence
+	client             ports.RemoteDaemonSessionLister
+	notifications      LocalNotifications
+	notificationClient ports.RemoteDaemonNotificationLister
+	timeout            time.Duration
+	clock              func() time.Time
+	log                *slog.Logger
 }
 
 type ListedSession struct {
@@ -80,14 +90,144 @@ func New(deps Deps) *Service {
 		log = slog.Default()
 	}
 	return &Service{
-		local:    deps.Local,
-		store:    deps.Store,
-		presence: deps.Presence,
-		client:   deps.Client,
-		timeout:  timeout,
-		clock:    clock,
-		log:      log,
+		local:              deps.Local,
+		store:              deps.Store,
+		presence:           deps.Presence,
+		client:             deps.Client,
+		notifications:      deps.Notifications,
+		notificationClient: deps.NotificationClient,
+		timeout:            timeout,
+		clock:              clock,
+		log:                log,
 	}
+}
+
+// RemoteNotificationFailure names a host whose notification list could not be
+// read. It is returned with the usable rows so the dashboard never mistakes a
+// partial result for an all-clear.
+type RemoteNotificationFailure struct {
+	HostID domain.RemoteHostID
+	Reason string
+}
+
+// NotificationListPage is the federation-aware notification response. It
+// preserves the local service DTO while adding explicit remote failure state.
+type NotificationListPage struct {
+	Notifications   []notificationsvc.Notification
+	NextCursor      string
+	UnreadCount     int
+	UnresolvedCount int
+	RemoteFailures  []RemoteNotificationFailure
+}
+
+type listedNotificationHost struct {
+	page    ports.RemoteNotificationListPage
+	failure *RemoteNotificationFailure
+}
+
+// ListNotifications returns local notifications plus concurrently-read remote
+// owner views. A remote failure is visible in RemoteFailures, never converted
+// into an apparently empty notification list.
+func (s *Service) ListNotifications(ctx context.Context, filter notificationsvc.ListFilter) (NotificationListPage, error) {
+	if s.notifications == nil {
+		return NotificationListPage{}, fmt.Errorf("local notification service is unavailable")
+	}
+	local, err := s.notifications.List(ctx, filter)
+	if err != nil {
+		return NotificationListPage{}, err
+	}
+	page := NotificationListPage{
+		Notifications:   append([]notificationsvc.Notification(nil), local.Notifications...),
+		NextCursor:      local.NextCursor,
+		UnreadCount:     local.UnreadCount,
+		UnresolvedCount: local.UnresolvedCount,
+	}
+	if s.presence == nil || !s.presence.HasRegisteredHosts() {
+		return page, nil
+	}
+	hosts, err := s.store.ListRemoteHosts(ctx)
+	if err != nil {
+		return NotificationListPage{}, fmt.Errorf("list registered remote hosts: %w", err)
+	}
+	remote := make([]listedNotificationHost, len(hosts))
+	var group sync.WaitGroup
+	for index, host := range hosts {
+		group.Add(1)
+		go func(index int, host domain.RemoteHost) {
+			defer group.Done()
+			remote[index] = s.listNotificationHost(ctx, host, filter)
+		}(index, host)
+	}
+	group.Wait()
+	for index, host := range hosts {
+		result := remote[index]
+		if result.failure != nil {
+			page.RemoteFailures = append(page.RemoteFailures, *result.failure)
+			continue
+		}
+		page.UnreadCount += result.page.UnreadCount
+		page.UnresolvedCount += result.page.UnresolvedCount
+		for _, record := range result.page.Notifications {
+			page.Notifications = append(page.Notifications, qualifiedRemoteNotification(host.HostID, record))
+		}
+		// A multi-owner page has no safe single-owner cursor. Keeping the
+		// cursor empty is explicit: it never points a later request at only one
+		// daemon and silently drops the others.
+		if result.page.NextCursor != "" {
+			page.NextCursor = ""
+		}
+	}
+	sort.SliceStable(page.Notifications, func(left, right int) bool {
+		if page.Notifications[left].CreatedAt.Equal(page.Notifications[right].CreatedAt) {
+			return page.Notifications[left].ID > page.Notifications[right].ID
+		}
+		return page.Notifications[left].CreatedAt.After(page.Notifications[right].CreatedAt)
+	})
+	if len(page.Notifications) > filter.Limit && filter.Limit > 0 {
+		page.Notifications = page.Notifications[:filter.Limit]
+		page.NextCursor = ""
+	}
+	return page, nil
+}
+
+func (s *Service) listNotificationHost(ctx context.Context, host domain.RemoteHost, filter notificationsvc.ListFilter) listedNotificationHost {
+	failure := func(reason string) listedNotificationHost {
+		return listedNotificationHost{failure: &RemoteNotificationFailure{HostID: host.HostID, Reason: reason}}
+	}
+	if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
+		return failure(fmt.Sprintf("remote host is %s", host.OperatorState))
+	}
+	if s.notificationClient == nil {
+		return failure("remote notification client is unavailable")
+	}
+	listCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	page, err := s.notificationClient.ListNotifications(listCtx, host.Address, filter.Status, filter.Limit, filter.Cursor)
+	if err != nil {
+		s.log.Warn("remote notification list failed", "hostId", host.HostID, "address", host.Address, "err", err)
+		return failure(err.Error())
+	}
+	return listedNotificationHost{page: page}
+}
+
+func qualifiedRemoteNotification(hostID domain.RemoteHostID, record domain.NotificationRecord) notificationsvc.Notification {
+	record.ID = domain.QualifyNotificationID(hostID, record.ID)
+	record.SessionID = domain.QualifySessionID(hostID, record.SessionID)
+	return notificationsvc.Notification{
+		NotificationRecord: record,
+		Target: notificationsvc.Target{
+			Kind:      notificationTargetKind(record),
+			SessionID: record.SessionID,
+			PRURL:     record.PRURL,
+		},
+	}
+}
+
+func notificationTargetKind(record domain.NotificationRecord) notificationsvc.TargetKind {
+	if record.PRURL != "" {
+		return notificationsvc.TargetPR
+	}
+	return notificationsvc.TargetSession
 }
 
 // List returns local sessions unchanged and adds remote sessions using their

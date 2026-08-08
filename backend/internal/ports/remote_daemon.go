@@ -25,3 +25,20 @@ type RemoteSessionListFilter struct {
 type RemoteDaemonSessionLister interface {
 	ListSessions(ctx context.Context, address string, filter RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error)
 }
+
+// RemoteNotificationListPage is one owner-daemon notification page. Notification
+// IDs and session IDs are deliberately bare here; federation qualifies both at
+// the local daemon boundary.
+type RemoteNotificationListPage struct {
+	Notifications   []domain.NotificationRecord
+	NextCursor      string
+	UnreadCount     int
+	UnresolvedCount int
+}
+
+// RemoteDaemonNotificationLister reads an owning daemon's notification view.
+// The filter mirrors the public notification-list query without importing an
+// HTTP controller into the federation boundary.
+type RemoteDaemonNotificationLister interface {
+	ListNotifications(ctx context.Context, address string, status domain.NotificationListStatus, limit int, cursor string) (RemoteNotificationListPage, error)
+}

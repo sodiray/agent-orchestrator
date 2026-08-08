@@ -1906,6 +1906,8 @@ export interface components {
         ListNotificationsResponse: {
             nextCursor?: string;
             notifications: components["schemas"]["NotificationResponse"][];
+            /** @description Registered remote hosts whose notifications could not be read. The list is partial; each reason must be shown to the operator. */
+            remoteFailures?: components["schemas"]["RemoteNotificationFailure"][];
             unreadCount: number;
             unresolvedCount: number;
         };
@@ -2141,6 +2143,10 @@ export interface components {
         };
         RemoteHostResponse: {
             remoteHost: components["schemas"]["RemoteHost"];
+        };
+        RemoteNotificationFailure: {
+            hostId: string;
+            reason: string;
         };
         RemoveProjectResult: {
             projectId: string;

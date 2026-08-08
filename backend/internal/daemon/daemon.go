@@ -257,11 +257,13 @@ func Run() error {
 		return fmt.Errorf("load remote host presence: %w", err)
 	}
 	federationSvc := federationsvc.New(federationsvc.Deps{
-		Local:    sessionSvc,
-		Store:    store,
-		Presence: remoteHostSvc,
-		Client:   remotedaemon.NewHTTPSessionLister(nil, 0),
-		Logger:   log,
+		Local:              sessionSvc,
+		Store:              store,
+		Presence:           remoteHostSvc,
+		Client:             remotedaemon.NewHTTPSessionLister(nil, 0),
+		Notifications:      notifier,
+		NotificationClient: remotedaemon.NewHTTPSessionLister(nil, 0),
+		Logger:             log,
 	})
 	remoteHostSvc.RunHealthProbes(ctx, remotehostsvc.DefaultProbeInterval)
 	if err := seedScratchProjectOnBoot(ctx, cfg, projectSvc); err != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 )
 
@@ -29,10 +30,20 @@ type NotificationStream interface {
 	Subscribe(projectID domain.ProjectID) (<-chan domain.NotificationEvent, func())
 }
 
+// NotificationBatchMutator acknowledges host-qualified notification IDs on
+// their owner daemons. The controller retains local rows at its normal service
+// boundary and delegates only explicitly remote identities.
+type NotificationBatchMutator interface {
+	MarkAllRead(ctx context.Context, ids []string) (int64, error)
+}
+
 // NotificationsController owns the /notifications routes.
 type NotificationsController struct {
-	Svc    NotificationService
-	Stream NotificationStream
+	Svc           NotificationService
+	Stream        NotificationStream
+	LocalStream   NotificationStream
+	Federation    *federationsvc.Service
+	RemoteMutator NotificationBatchMutator
 }
 
 // Register mounts bounded notification REST routes on the supplied router.
@@ -57,7 +68,7 @@ func (c *NotificationsController) list(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_QUERY", err.Error(), nil)
 		return
 	}
-	page, err := c.Svc.List(r.Context(), filter)
+	page, err := c.listNotifications(r.Context(), r.Header.Get("X-AO-Federation-Local") == "1", filter)
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -67,7 +78,28 @@ func (c *NotificationsController) list(w http.ResponseWriter, r *http.Request) {
 		NextCursor:      page.NextCursor,
 		UnreadCount:     page.UnreadCount,
 		UnresolvedCount: page.UnresolvedCount,
+		RemoteFailures:  remoteNotificationFailures(page.RemoteFailures),
 	})
+}
+
+type listedNotifications struct {
+	Notifications   []notificationsvc.Notification
+	NextCursor      string
+	UnreadCount     int
+	UnresolvedCount int
+	RemoteFailures  []federationsvc.RemoteNotificationFailure
+}
+
+func (c *NotificationsController) listNotifications(ctx context.Context, ownerOnly bool, filter notificationsvc.ListFilter) (listedNotifications, error) {
+	if c.Federation != nil && !ownerOnly {
+		page, err := c.Federation.ListNotifications(ctx, filter)
+		return listedNotifications{
+			Notifications: page.Notifications, NextCursor: page.NextCursor, UnreadCount: page.UnreadCount,
+			UnresolvedCount: page.UnresolvedCount, RemoteFailures: page.RemoteFailures,
+		}, err
+	}
+	page, err := c.Svc.List(ctx, filter)
+	return listedNotifications{Notifications: page.Notifications, NextCursor: page.NextCursor, UnreadCount: page.UnreadCount, UnresolvedCount: page.UnresolvedCount}, err
 }
 
 func (c *NotificationsController) markRead(w http.ResponseWriter, r *http.Request) {
@@ -105,15 +137,40 @@ func (c *NotificationsController) markAllRead(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	updatedCount, err := c.Svc.MarkAllRead(r.Context(), req.IDs)
+	localIDs, remoteIDs := splitNotificationIDs(req.IDs)
+	updatedCount, err := c.Svc.MarkAllRead(r.Context(), localIDs)
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
+	}
+	if c.RemoteMutator != nil && (len(remoteIDs) > 0 || len(req.IDs) == 0) {
+		remoteUpdated, err := c.RemoteMutator.MarkAllRead(r.Context(), remoteIDs)
+		if err != nil {
+			envelope.WriteError(w, r, err)
+			return
+		}
+		updatedCount += remoteUpdated
 	}
 	envelope.WriteJSON(w, http.StatusOK, MarkAllNotificationsReadResponse{
 		Notifications: []NotificationResponse{},
 		UpdatedCount:  updatedCount,
 	})
+}
+
+func splitNotificationIDs(ids []string) ([]string, []string) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	local := make([]string, 0, len(ids))
+	remote := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := domain.ParseQualifiedNotificationID(id); ok {
+			remote = append(remote, id)
+			continue
+		}
+		local = append(local, id)
+	}
+	return local, remote
 }
 
 func (c *NotificationsController) stream(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +183,11 @@ func (c *NotificationsController) stream(w http.ResponseWriter, r *http.Request)
 		envelope.WriteAPIError(w, r, http.StatusInternalServerError, "internal", "SSE_UNSUPPORTED", "Streaming is not supported by this server", nil)
 		return
 	}
-	ch, unsubscribe := c.Stream.Subscribe(domain.ProjectID(r.URL.Query().Get("projectId")))
+	stream := c.Stream
+	if r.Header.Get("X-AO-Federation-Local") == "1" && c.LocalStream != nil {
+		stream = c.LocalStream
+	}
+	ch, unsubscribe := stream.Subscribe(domain.ProjectID(r.URL.Query().Get("projectId")))
 	defer unsubscribe()
 
 	h := w.Header()
@@ -249,4 +310,12 @@ func notificationTargetFromRecord(rec domain.NotificationRecord) NotificationTar
 		return NotificationTarget{Kind: "pr", SessionID: string(rec.SessionID), PRURL: rec.PRURL}
 	}
 	return NotificationTarget{Kind: "session", SessionID: string(rec.SessionID)}
+}
+
+func remoteNotificationFailures(in []federationsvc.RemoteNotificationFailure) []RemoteNotificationFailure {
+	out := make([]RemoteNotificationFailure, 0, len(in))
+	for _, failure := range in {
+		out = append(out, RemoteNotificationFailure{HostID: string(failure.HostID), Reason: failure.Reason})
+	}
+	return out
 }

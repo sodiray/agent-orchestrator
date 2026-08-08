@@ -273,6 +273,7 @@ var schemaNames = map[string]string{
 	"ControllersNotificationIDParam":                      "NotificationIDParam",
 	"ControllersNotificationTarget":                       "NotificationTarget",
 	"ControllersNotificationResponse":                     "NotificationResponse",
+	"ControllersRemoteNotificationFailure":                "RemoteNotificationFailure",
 	"ControllersListNotificationsResponse":                "ListNotificationsResponse",
 	"ControllersMarkNotificationReadRequest":              "MarkNotificationReadRequest",
 	"ControllersNotificationEnvelope":                     "NotificationEnvelope",

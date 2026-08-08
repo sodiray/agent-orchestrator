@@ -62,6 +62,35 @@ func TestSessionProxyLeavesBareSessionLocal(t *testing.T) {
 	}
 }
 
+func TestSessionProxyRoutesQualifiedNotificationMutationToOwner(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/api/v1/notifications/ntf_7" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "" {
+			t.Error("authorization header was forwarded")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"notification":{"id":"ntf_7","sessionId":"project-7","projectId":"project","type":"needs_input","title":"input","body":"","status":"read","createdAt":"2026-08-08T10:00:00Z","target":{"kind":"session","sessionId":"project-7"}}}`))
+	}))
+	defer remote.Close()
+	remoteURL, err := url.Parse(remote.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &proxyStore{host: domain.RemoteHost{HostID: "workstation", Address: remoteURL.Host}, found: true}
+	handler := newProxyForTest(store).Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("local notification handler should not run")
+	}))
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/notifications/workstation~ntf_7", bytes.NewBufferString(`{"status":"read"}`))
+	req.Header.Set("Authorization", "Bearer local-secret")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"id":"workstation~ntf_7"`) || !strings.Contains(res.Body.String(), `"sessionId":"workstation~project-7"`) {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
 func TestSessionProxyForwardsMethodBodyHeadersAndStatus(t *testing.T) {
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {

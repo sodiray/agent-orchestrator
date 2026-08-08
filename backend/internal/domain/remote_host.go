@@ -46,6 +46,13 @@ type QualifiedSessionID struct {
 	SessionID SessionID
 }
 
+// QualifiedNotificationID identifies a notification owned by a remote daemon.
+// Local notification IDs intentionally remain bare.
+type QualifiedNotificationID struct {
+	HostID         RemoteHostID
+	NotificationID string
+}
+
 // QualifySessionID formats a remote session identity for the local API.
 func QualifySessionID(hostID RemoteHostID, sessionID SessionID) SessionID {
 	return SessionID(string(hostID) + qualifiedSessionSeparator + string(sessionID))
@@ -75,6 +82,25 @@ func ParseQualifiedSessionID(id SessionID) (QualifiedSessionID, bool) {
 		return QualifiedSessionID{}, false
 	}
 	return QualifiedSessionID{HostID: hostID, SessionID: SessionID(parts[1])}, true
+}
+
+// QualifyNotificationID formats a remote notification identity for the local API.
+func QualifyNotificationID(hostID RemoteHostID, notificationID string) string {
+	return string(hostID) + qualifiedSessionSeparator + notificationID
+}
+
+// ParseQualifiedNotificationID recognizes the remote-only hostId~notificationId form.
+// A non-matching ID is local by definition.
+func ParseQualifiedNotificationID(id string) (QualifiedNotificationID, bool) {
+	parts := strings.Split(id, qualifiedSessionSeparator)
+	if len(parts) != 2 || parts[1] == "" || strings.Contains(parts[1], qualifiedSessionSeparator) {
+		return QualifiedNotificationID{}, false
+	}
+	hostID := RemoteHostID(parts[0])
+	if ValidateRemoteHostID(hostID) != nil {
+		return QualifiedNotificationID{}, false
+	}
+	return QualifiedNotificationID{HostID: hostID, NotificationID: parts[1]}, true
 }
 
 // RemoteSessionSnapshot is the last read model received from a remote daemon.
