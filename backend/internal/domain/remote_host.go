@@ -51,6 +51,18 @@ func QualifySessionID(hostID RemoteHostID, sessionID SessionID) SessionID {
 	return SessionID(string(hostID) + qualifiedSessionSeparator + string(sessionID))
 }
 
+// QualifyRemoteSessionID makes an owning daemon's bare session identity safe
+// for use at the federation boundary.
+func QualifyRemoteSessionID(hostID RemoteHostID, sessionID SessionID) (SessionID, error) {
+	if err := ValidateRemoteHostID(hostID); err != nil {
+		return "", err
+	}
+	if sessionID == "" || strings.Contains(string(sessionID), qualifiedSessionSeparator) {
+		return "", fmt.Errorf("remote session id must be a non-empty bare id")
+	}
+	return QualifySessionID(hostID, sessionID), nil
+}
+
 // ParseQualifiedSessionID recognizes the remote-only hostId~sessionId form.
 // Any ID that does not meet this exact form is local by definition.
 func ParseQualifiedSessionID(id SessionID) (QualifiedSessionID, bool) {

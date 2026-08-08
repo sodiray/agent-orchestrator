@@ -12,7 +12,7 @@ func TestFederatedSessionViewsQualifiesAndMarksUnavailableRemoteSessions(t *test
 		Remote: &federationsvc.RemoteSession{
 			HostID:            "workstation",
 			SessionID:         "project-7",
-			View:              []byte(`{"id":"project-7","projectId":"project","kind":"worker","status":"idle","terminalHandleId":"pane-7","prs":[]}`),
+			View:              []byte(`{"id":"project-7","projectId":"project","kind":"worker","status":"idle","terminalHandleId":"pane-7","previewUrl":"http://127.0.0.1:5173","prs":[]}`),
 			UnavailableReason: "connection refused",
 		},
 	}})
@@ -25,6 +25,9 @@ func TestFederatedSessionViewsQualifiesAndMarksUnavailableRemoteSessions(t *test
 	}
 	if view.TerminalHandleID != "workstation~pane-7" {
 		t.Fatalf("terminal handle = %q", view.TerminalHandleID)
+	}
+	if view.PreviewURL != "" {
+		t.Fatalf("preview URL = %q, want unavailable", view.PreviewURL)
 	}
 	if view.Availability != "unavailable" || view.UnavailableReason != "connection refused" {
 		t.Fatalf("availability = (%q, %q)", view.Availability, view.UnavailableReason)

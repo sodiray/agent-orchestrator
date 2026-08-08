@@ -263,7 +263,7 @@ func Run() error {
 		Client:   remotedaemon.NewHTTPSessionLister(nil, 0),
 		Logger:   log,
 	})
-	go remoteHostSvc.RunHealthProbes(ctx, remotehostsvc.DefaultProbeInterval)
+	remoteHostSvc.RunHealthProbes(ctx, remotehostsvc.DefaultProbeInterval)
 	if err := seedScratchProjectOnBoot(ctx, cfg, projectSvc); err != nil {
 		stop()
 		lcStack.Stop()

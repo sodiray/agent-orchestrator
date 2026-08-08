@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,7 +14,12 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
-const DefaultProbeInterval = 30 * time.Second
+const (
+	DefaultProbeInterval = 30 * time.Second
+	DefaultProbeTimeout  = 2 * time.Second
+
+	remoteHostProbeWorkers = 8
+)
 
 type Store interface {
 	CreateRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error)
@@ -51,10 +57,11 @@ type Host struct {
 }
 
 type Deps struct {
-	Store  Store
-	Prober ports.RemoteDaemonProber
-	Clock  func() time.Time
-	Logger *slog.Logger
+	Store        Store
+	Prober       ports.RemoteDaemonProber
+	Clock        func() time.Time
+	Logger       *slog.Logger
+	ProbeTimeout time.Duration
 }
 
 type Service struct {
@@ -63,6 +70,17 @@ type Service struct {
 	clock  func() time.Time
 	log    *slog.Logger
 	count  atomic.Int64
+
+	probeTimeout  time.Duration
+	probeMu       sync.Mutex
+	probeCtx      context.Context
+	probeInterval time.Duration
+	probeWorker   *healthProbeWorker
+}
+
+type healthProbeWorker struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 var _ Manager = (*Service)(nil)
@@ -76,7 +94,11 @@ func New(deps Deps) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{store: deps.Store, prober: deps.Prober, clock: clock, log: log}
+	probeTimeout := deps.ProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = DefaultProbeTimeout
+	}
+	return &Service{store: deps.Store, prober: deps.Prober, clock: clock, log: log, probeTimeout: probeTimeout}
 }
 
 // LoadPresence initializes the in-memory registered-host count during daemon
@@ -129,6 +151,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) 
 		return Host{}, apierr.Conflict("REMOTE_HOST_ALREADY_REGISTERED", "A remote host with this id is already registered", nil)
 	}
 	s.count.Add(1)
+	s.startHealthProbeWorker()
 	return s.probe(ctx, host)
 }
 
@@ -210,17 +233,67 @@ func (s *Service) Deregister(ctx context.Context, id domain.RemoteHostID) error 
 	if !deleted {
 		return apierr.NotFound("REMOTE_HOST_NOT_FOUND", "Unknown remote host")
 	}
+	remaining := int64(0)
 	for current := s.count.Load(); current > 0; current = s.count.Load() {
 		if s.count.CompareAndSwap(current, current-1) {
+			remaining = current - 1
 			break
 		}
+	}
+	if remaining == 0 {
+		s.stopHealthProbeWorker()
 	}
 	return nil
 }
 
+// RunHealthProbes configures the daemon-lifetime probe worker. It starts no
+// goroutine until at least one host is registered; Register starts the worker
+// later if the daemon booted with an empty registry.
 func (s *Service) RunHealthProbes(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = DefaultProbeInterval
+	}
+	s.probeMu.Lock()
+	s.probeCtx = ctx
+	s.probeInterval = interval
+	s.startHealthProbeWorkerLocked()
+	s.probeMu.Unlock()
+}
+
+func (s *Service) startHealthProbeWorker() {
+	s.probeMu.Lock()
+	s.startHealthProbeWorkerLocked()
+	s.probeMu.Unlock()
+}
+
+func (s *Service) startHealthProbeWorkerLocked() {
+	if s.count.Load() == 0 || s.probeWorker != nil || s.probeCtx == nil || s.probeCtx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(s.probeCtx)
+	worker := &healthProbeWorker{cancel: cancel, done: make(chan struct{})}
+	s.probeWorker = worker
+	go s.runHealthProbes(ctx, s.probeInterval, worker)
+}
+
+func (s *Service) stopHealthProbeWorker() {
+	s.probeMu.Lock()
+	worker := s.probeWorker
+	if worker != nil {
+		worker.cancel()
+		s.probeWorker = nil
+	}
+	s.probeMu.Unlock()
+	if worker != nil {
+		<-worker.done
+	}
+}
+
+func (s *Service) runHealthProbes(ctx context.Context, interval time.Duration, worker *healthProbeWorker) {
+	defer close(worker.done)
+	defer s.finishHealthProbeWorker(worker)
+	if !s.HasRegisteredHosts() {
+		return
 	}
 	s.probeAll(ctx)
 	ticker := time.NewTicker(interval)
@@ -230,22 +303,63 @@ func (s *Service) RunHealthProbes(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if !s.HasRegisteredHosts() {
+				return
+			}
 			s.probeAll(ctx)
 		}
 	}
 }
 
+func (s *Service) finishHealthProbeWorker(worker *healthProbeWorker) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.probeWorker != worker {
+		return
+	}
+	s.probeWorker = nil
+}
+
 func (s *Service) probeAll(ctx context.Context) {
+	if !s.HasRegisteredHosts() {
+		return
+	}
 	hosts, err := s.store.ListRemoteHosts(ctx)
 	if err != nil {
 		s.log.Error("list remote hosts for health probe failed", "err", err)
 		return
 	}
+	workers := min(len(hosts), remoteHostProbeWorkers)
+	if workers == 0 {
+		return
+	}
+	jobs := make(chan domain.RemoteHost)
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for host := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				if _, err := s.probe(ctx, host); err != nil {
+					s.log.Error("remote host health probe recording failed", "hostId", host.HostID, "err", err)
+				}
+			}
+		}()
+	}
 	for _, host := range hosts {
-		if _, err := s.probe(ctx, host); err != nil {
-			s.log.Error("remote host health probe recording failed", "hostId", host.HostID, "err", err)
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			group.Wait()
+			return
+		case jobs <- host:
 		}
 	}
+	close(jobs)
+	group.Wait()
 }
 
 func (s *Service) probe(ctx context.Context, host domain.RemoteHost) (Host, error) {
@@ -257,7 +371,13 @@ func (s *Service) probe(ctx context.Context, host domain.RemoteHost) (Host, erro
 		s.log.Error("remote host health probe unavailable", "hostId", host.HostID, "err", err)
 		return Host{}, apierr.Internal("REMOTE_HOST_PROBER_UNAVAILABLE", "Remote host health probing is unavailable")
 	}
-	err := s.prober.Probe(ctx, host.Address)
+	probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+	err := s.prober.Probe(probeCtx, host.Address)
+	cancel()
+	if ctx.Err() != nil {
+		s.log.Info("remote host health probe canceled", "hostId", host.HostID, "address", host.Address, "reason", ctx.Err())
+		return Host{}, ctx.Err()
+	}
 	now := s.clock().UTC()
 	failureReason := ""
 	if err != nil {

@@ -2,12 +2,14 @@ package httpd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -64,6 +66,46 @@ type fakeEventSubscriber struct {
 	mu sync.Mutex
 	fn func(cdc.Event)
 }
+
+type tailEventSource struct {
+	live      *fakeEventSubscriber
+	after     int64
+	latestSeq int64
+}
+
+func (s *tailEventSource) EventsAfter(_ context.Context, after int64, _ int) ([]cdc.Event, error) {
+	s.after = after
+	s.live.publish(testCDCEvent(after + 1))
+	return nil, nil
+}
+
+func (s *tailEventSource) LatestSeq(context.Context) (int64, error) {
+	return s.latestSeq, nil
+}
+
+type cancelOnEventWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	cancel context.CancelFunc
+}
+
+func (w *cancelOnEventWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *cancelOnEventWriter) Write(data []byte) (int, error) {
+	if _, err := w.body.Write(data); err != nil {
+		return 0, err
+	}
+	if bytes.Contains(data, []byte("id: 2049\n")) {
+		w.cancel()
+	}
+	return len(data), nil
+}
+
+func (*cancelOnEventWriter) WriteHeader(int) {}
+
+func (*cancelOnEventWriter) Flush() {}
 
 func (s *fakeEventSubscriber) Subscribe(fn func(cdc.Event)) func() {
 	s.mu.Lock()
@@ -130,6 +172,24 @@ func TestEventsStreamSubscribesBeforeReplayAndDrainsBufferedLive(t *testing.T) {
 	}
 	if !src.sawSubscriptionOnReplay {
 		t.Fatal("replay started before live subscription was installed")
+	}
+}
+
+func TestEventsStreamTailSkipsHistoryWithoutLosingCaptureSubscriptionGap(t *testing.T) {
+	live := &fakeEventSubscriber{}
+	src := &tailEventSource{live: live, latestSeq: 2048}
+	controller := &EventsController{Source: src, Live: live}
+	ctx, cancel := context.WithCancel(context.Background())
+	writer := &cancelOnEventWriter{header: make(http.Header), cancel: cancel}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events?after=0&tail=1", nil).WithContext(ctx)
+
+	controller.stream(writer, req)
+
+	if src.after != 2048 {
+		t.Fatalf("tail replay cursor = %d, want 2048", src.after)
+	}
+	if got := writer.body.String(); strings.Contains(got, "id: 1\n") || !strings.Contains(got, "id: 2049\n") {
+		t.Fatalf("tail stream body = %q, want only the post-capture event", got)
 	}
 }
 
@@ -215,7 +275,7 @@ func TestEventsRemoteFanInIsNoOpWithoutRegisteredHosts(t *testing.T) {
 	})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	remote, wait := controller.remoteEvents(ctx, cancel)
+	remote, wait := controller.remoteEvents(ctx)
 	defer wait()
 	if store.calls != 0 {
 		t.Fatalf("remote-host reads = %d, want 0", store.calls)
@@ -228,9 +288,13 @@ func TestEventsRemoteFanInIsNoOpWithoutRegisteredHosts(t *testing.T) {
 }
 
 func TestRemoteEventFanInReconnectsAfterDroppedStream(t *testing.T) {
-	requests := make(chan string, 4)
+	type remoteRequest struct {
+		after string
+		tail  string
+	}
+	requests := make(chan remoteRequest, 4)
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- r.URL.Query().Get("after")
+		requests <- remoteRequest{after: r.URL.Query().Get("after"), tail: r.URL.Query().Get("tail")}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
@@ -260,7 +324,7 @@ func TestRemoteEventFanInReconnectsAfterDroppedStream(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		controller.forwardRemoteEvents(ctx, cancel, store.hosts[0], out)
+		controller.forwardRemoteEvents(ctx, store.hosts[0], out)
 	}()
 	for index := 0; index < 2; index++ {
 		select {
@@ -272,8 +336,65 @@ func TestRemoteEventFanInReconnectsAfterDroppedStream(t *testing.T) {
 			t.Fatal("timed out waiting for forwarded remote event")
 		}
 	}
-	if first, second := <-requests, <-requests; first != "0" || second != "1" {
-		t.Fatalf("remote replay cursors = %q, %q", first, second)
+	if first, second := <-requests, <-requests; first.after != "0" || first.tail != "1" || second.after != "1" || second.tail != "" {
+		t.Fatalf("remote replay requests = %#v, %#v; want tail then resume after 1", first, second)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("remote fan-in did not stop after local stream cancellation")
+	}
+}
+
+func TestRemoteEventFanInLargeBacklogBackpressuresWithoutCancelingLocalStream(t *testing.T) {
+	requests := make(chan url.Values, 1)
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Query()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for sequence := int64(1); sequence <= eventsLiveBuffer+1; sequence++ {
+			_, _ = w.Write([]byte("data: {\"seq\":" + strconv.FormatInt(sequence, 10) + ",\"sessionId\":\"project-7\",\"type\":\"session_updated\"}\n\n"))
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer remote.Close()
+	remoteURL, err := url.Parse(remote.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := &EventsController{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan cdc.Event, eventsLiveBuffer)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		controller.forwardRemoteEvents(ctx, domain.RemoteHost{HostID: "workstation", Address: remoteURL.Host}, out)
+	}()
+	select {
+	case request := <-requests:
+		if request.Get("tail") != "1" || request.Get("after") != "0" {
+			t.Fatalf("initial remote request = %s, want after=0&tail=1", request.Encode())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for remote subscription")
+	}
+	deadline := time.After(3 * time.Second)
+	for len(out) != eventsLiveBuffer {
+		select {
+		case <-deadline:
+			t.Fatalf("forwarded events = %d, want %d", len(out), eventsLiveBuffer)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("large remote backlog ended the local stream")
+	default:
 	}
 	cancel()
 	select {

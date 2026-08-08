@@ -65,3 +65,18 @@ func TestParseQualifiedSessionIDRejectsNonQualifiedIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestQualifyRemoteSessionIDRejectsNonBareIdentity(t *testing.T) {
+	for _, sessionID := range []SessionID{"", "other-host~project-42"} {
+		if _, err := QualifyRemoteSessionID("build-host", sessionID); err == nil {
+			t.Errorf("QualifyRemoteSessionID(%q) error = nil", sessionID)
+		}
+	}
+	qualified, err := QualifyRemoteSessionID("build-host", "project-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qualified != "build-host~project-42" {
+		t.Fatalf("qualified = %q", qualified)
+	}
+}

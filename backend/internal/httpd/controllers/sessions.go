@@ -1456,6 +1456,10 @@ func federatedSessionViews(sessions []federationsvc.ListedSession) []SessionView
 		if view.TerminalHandleID != "" {
 			view.TerminalHandleID = string(domain.QualifySessionID(listed.Remote.HostID, domain.SessionID(view.TerminalHandleID)))
 		}
+		// Remote preview targets resolve on the owning machine. Until they have a
+		// routed browser surface, exposing one here would silently target the
+		// operator's local port instead.
+		view.PreviewURL = ""
 		view.HostID = string(listed.Remote.HostID)
 		if listed.Remote.Available {
 			view.Availability = "available"

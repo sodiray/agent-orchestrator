@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,8 +30,6 @@ const (
 	remoteEventsReconnectMin = 100 * time.Millisecond
 	remoteEventsReconnectMax = 5 * time.Second
 )
-
-var errEventsLiveBufferFull = errors.New("local event stream buffer is full")
 
 type cdcSubscriber interface {
 	Subscribe(func(cdc.Event)) (unsubscribe func())
@@ -65,6 +62,19 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 			"after must be a non-negative integer", nil)
 		return
 	}
+	if r.URL.Query().Get("tail") == "1" {
+		// Capture before installing the live subscription. replay runs after the
+		// subscription is installed, so changes in this small gap are replayed
+		// rather than lost while durable history before the capture is skipped.
+		after, err = c.Source.LatestSeq(r.Context())
+		if err != nil {
+			c.logger().Error("capture event stream tail failed", "err", err)
+			envelope.WriteAPIError(w, r, http.StatusInternalServerError, "internal", "EVENT_TAIL_UNAVAILABLE",
+				"The event stream tail is unavailable", nil)
+			return
+		}
+		c.logger().Info("event stream starts at captured tail", "after", after, "reason", "tail requested")
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -90,7 +100,7 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 	var remote <-chan cdc.Event
 	waitRemote := func() {}
 	if r.Header.Get("X-AO-Federation-Local") != "1" {
-		remote, waitRemote = c.remoteEvents(ctx, cancel)
+		remote, waitRemote = c.remoteEvents(ctx)
 	}
 	defer func() {
 		cancel()
@@ -130,7 +140,7 @@ func (c *EventsController) stream(w http.ResponseWriter, r *http.Request) {
 // this local client stream. Remote event sequence numbers stay meaningful only
 // to their owner, so forwarded frames deliberately have no SSE id: they cannot
 // corrupt the local daemon's durable replay cursor.
-func (c *EventsController) remoteEvents(ctx context.Context, cancel context.CancelFunc) (<-chan cdc.Event, func()) {
+func (c *EventsController) remoteEvents(ctx context.Context) (<-chan cdc.Event, func()) {
 	out := make(chan cdc.Event, eventsLiveBuffer)
 	if c.Federation == nil || !c.Federation.HasRegisteredHosts() {
 		return out, func() {}
@@ -149,17 +159,22 @@ func (c *EventsController) remoteEvents(ctx context.Context, cancel context.Canc
 		group.Add(1)
 		go func(host domain.RemoteHost) {
 			defer group.Done()
-			c.forwardRemoteEvents(ctx, cancel, host, out)
+			c.forwardRemoteEvents(ctx, host, out)
 		}(host)
 	}
 	return out, func() { group.Wait() }
 }
 
-func (c *EventsController) forwardRemoteEvents(ctx context.Context, cancel context.CancelFunc, host domain.RemoteHost, out chan<- cdc.Event) {
+func (c *EventsController) forwardRemoteEvents(ctx context.Context, host domain.RemoteHost, out chan<- cdc.Event) {
 	after := int64(0)
+	tail := true
 	for attempt := 0; ; attempt++ {
-		err := c.readRemoteEvents(ctx, host, after, func(e cdc.Event) error {
+		if tail {
+			c.logger().Info("remote event stream starts at captured tail", "hostId", host.HostID, "address", host.Address, "reason", "no observed remote cursor")
+		}
+		err := c.readRemoteEvents(ctx, host, after, tail, func(e cdc.Event) error {
 			after = e.Seq
+			tail = false
 			qualified, err := qualifyRemoteEvent(host.HostID, e)
 			if err != nil {
 				return err
@@ -169,8 +184,6 @@ func (c *EventsController) forwardRemoteEvents(ctx context.Context, cancel conte
 				return nil
 			case <-ctx.Done():
 				return ctx.Err()
-			default:
-				return errEventsLiveBufferFull
 			}
 		})
 		if ctx.Err() != nil {
@@ -178,10 +191,6 @@ func (c *EventsController) forwardRemoteEvents(ctx context.Context, cancel conte
 		}
 		if err != nil {
 			c.logger().Warn("remote event stream dropped", "hostId", host.HostID, "address", host.Address, "err", err)
-			if errors.Is(err, errEventsLiveBufferFull) {
-				cancel()
-				return
-			}
 		} else {
 			c.logger().Warn("remote event stream ended", "hostId", host.HostID, "address", host.Address)
 		}
@@ -191,10 +200,13 @@ func (c *EventsController) forwardRemoteEvents(ctx context.Context, cancel conte
 	}
 }
 
-func (c *EventsController) readRemoteEvents(ctx context.Context, host domain.RemoteHost, after int64, handle func(cdc.Event) error) error {
+func (c *EventsController) readRemoteEvents(ctx context.Context, host domain.RemoteHost, after int64, tail bool, handle func(cdc.Event) error) error {
 	endpoint := url.URL{Scheme: "http", Host: host.Address, Path: "/api/v1/events"}
 	query := endpoint.Query()
 	query.Set("after", strconv.FormatInt(after, 10))
+	if tail {
+		query.Set("tail", "1")
+	}
 	endpoint.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
