@@ -463,6 +463,28 @@ describe("NotificationCenter", () => {
 		await userEvent.click(screen.getByRole("button", { name: /notifications/i }));
 
 		expect(await screen.findByText("No notifications yet.")).toBeInTheDocument();
+		expect(screen.queryByText(/Notifications could not be loaded from/i)).not.toBeInTheDocument();
+	});
+
+	it("shows remote notification failures in the bell and panel without hiding available notifications", async () => {
+		const remoteFailures = [{ hostId: "build-host-2", reason: "connection refused" }];
+		notificationQueryMock.mockImplementation((status: NotificationListStatus) => {
+			const result = notificationQueryResult(status);
+			return {
+				...result,
+				data: {
+					...result.data,
+					pages: result.data.pages.map((page) => ({ ...page, remoteFailures })),
+				},
+			};
+		});
+		renderNotificationCenter();
+
+		await userEvent.click(screen.getByRole("button", { name: "Notifications unavailable from 1 host" }));
+
+		expect(await screen.findByText("Notifications could not be loaded from 1 host.")).toBeInTheDocument();
+		expect(screen.getByText("build-host-2 is unavailable: connection refused")).toBeInTheDocument();
+		expect(screen.getByText("Checkout flow needs input")).toBeInTheDocument();
 	});
 
 	it("navigates to the session from anywhere on the row, including the body text", async () => {

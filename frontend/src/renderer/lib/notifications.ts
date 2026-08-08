@@ -5,6 +5,7 @@ import { apiClient, apiErrorMessage, getApiBaseUrl, subscribeApiBaseUrl } from "
 
 export type NotificationDTO = components["schemas"]["NotificationResponse"];
 export type NotificationsPage = components["schemas"]["ListNotificationsResponse"];
+export type RemoteNotificationFailure = components["schemas"]["RemoteNotificationFailure"];
 export type NotificationsCache = InfiniteData<NotificationsPage>;
 export type NotificationListStatus = "unread" | "all";
 
@@ -48,6 +49,7 @@ export async function fetchNotificationsPage(status: NotificationListStatus, cur
 	return {
 		notifications,
 		nextCursor: data?.nextCursor,
+		...(data?.remoteFailures ? { remoteFailures: data.remoteFailures } : {}),
 		unreadCount: data?.unreadCount ?? notifications.filter((item) => item.status === "unread").length,
 		unresolvedCount: data?.unresolvedCount ?? notifications.filter(isUnresolved).length,
 	};
@@ -170,11 +172,13 @@ export function markAllCachedNotificationsRead(
 			if (!current) {
 				return { pageParams: [""], pages: [{ notifications: [], unreadCount: 0, unresolvedCount: 0 }] };
 			}
+			const remoteFailures = current.pages[0]?.remoteFailures;
 			return {
 				pageParams: [""],
 				pages: [
 					{
 						notifications: [],
+						...(remoteFailures ? { remoteFailures } : {}),
 						unreadCount: 0,
 						unresolvedCount: current.pages[0]?.unresolvedCount ?? 0,
 					},
@@ -239,6 +243,16 @@ export function getCachedUnreadCount(cache: NotificationsCache | undefined): num
 	return (
 		cache?.pages[0]?.unreadCount ?? getCachedNotifications(cache).filter((item) => item.status === "unread").length
 	);
+}
+
+export function getCachedRemoteFailures(cache: NotificationsCache | undefined): RemoteNotificationFailure[] {
+	const byHostId = new Map<string, RemoteNotificationFailure>();
+	for (const page of cache?.pages ?? []) {
+		for (const failure of page.remoteFailures ?? []) {
+			if (!byHostId.has(failure.hostId)) byHostId.set(failure.hostId, failure);
+		}
+	}
+	return [...byHostId.values()];
 }
 
 export function keepLatestNotificationsPage(

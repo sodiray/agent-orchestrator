@@ -147,6 +147,21 @@ describe("notification cache helpers", () => {
 		});
 	});
 
+	it("preserves remote notification failures", async () => {
+		apiGetMock.mockResolvedValue({
+			data: {
+				notifications: [],
+				remoteFailures: [{ hostId: "build-host-2", reason: "connection refused" }],
+				unreadCount: 0,
+				unresolvedCount: 0,
+			},
+		});
+
+		await expect(fetchNotificationsPage("unread")).resolves.toMatchObject({
+			remoteFailures: [{ hostId: "build-host-2", reason: "connection refused" }],
+		});
+	});
+
 	it("merges unread notifications by id", () => {
 		const qc = queryClient();
 

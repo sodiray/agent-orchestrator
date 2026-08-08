@@ -25,6 +25,7 @@ import { formatTimeCompact } from "../lib/format-time";
 import {
 	createNotificationsTransport,
 	getCachedNotifications,
+	getCachedRemoteFailures,
 	getCachedUnreadCount,
 	keepLatestNotificationsPage,
 	type NotificationDTO,
@@ -179,6 +180,9 @@ export function NotificationCenter({ style }: NotificationCenterProps) {
 	}, [workspaces]);
 	const notifications = useMemo(() => getCachedNotifications(allQuery.data), [allQuery.data]);
 	const unreadCount = getCachedUnreadCount(unreadQuery.data);
+	const unreadRemoteFailures = getCachedRemoteFailures(unreadQuery.data);
+	const remoteFailures = getCachedRemoteFailures(allQuery.data ?? unreadQuery.data);
+	const hasRemoteFailures = unreadRemoteFailures.length > 0;
 	const { openSession } = useNotificationTargetNavigation();
 	const markAllMutate = markAllRead.mutateAsync;
 
@@ -284,7 +288,13 @@ export function NotificationCenter({ style }: NotificationCenterProps) {
 		<Popover onOpenChange={setPanelOpen} open={open}>
 			<PopoverTrigger asChild>
 				<TopbarButton
-					aria-label={unreadCount > 0 ? t("notify.unreadCount", { count: unreadCount }) : t("notify.bell")}
+					aria-label={
+						hasRemoteFailures
+							? t("notify.remoteFailuresBell", { count: unreadRemoteFailures.length })
+							: unreadCount > 0
+								? t("notify.unreadCount", { count: unreadCount })
+								: t("notify.bell")
+					}
 					className="relative"
 					style={style}
 					variant="icon"
@@ -298,6 +308,12 @@ export function NotificationCenter({ style }: NotificationCenterProps) {
 						<span className="pointer-events-none absolute -right-0.5 -top-0.5 grid min-w-4 place-items-center rounded-full bg-foreground px-1 font-mono text-[9px] font-semibold leading-4 text-background shadow-sm">
 							{unreadCount > 99 ? "99+" : unreadCount}
 						</span>
+					) : null}
+					{hasRemoteFailures ? (
+						<CircleAlert
+							aria-hidden="true"
+							className="pointer-events-none absolute -bottom-0.5 -right-1 size-3.5 rounded-full bg-background text-warning"
+						/>
 					) : null}
 				</TopbarButton>
 			</PopoverTrigger>
@@ -342,6 +358,23 @@ export function NotificationCenter({ style }: NotificationCenterProps) {
 						>
 							{t("notify.retry")}
 						</button>
+					</div>
+				) : null}
+				{remoteFailures.length > 0 ? (
+					<div aria-live="polite" className="border-b border-border bg-warning/5 px-4 py-2 text-caption text-warning" role="status">
+						<div className="flex items-start gap-2">
+							<CircleAlert aria-hidden="true" className="mt-0.5 size-icon-sm shrink-0" />
+							<div className="min-w-0">
+								<p>{t("notify.remoteFailures", { count: remoteFailures.length })}</p>
+								<ul className="mt-1 space-y-0.5 text-muted-foreground">
+									{remoteFailures.map((failure) => (
+										<li key={failure.hostId}>
+											{t("remoteHost.unavailableDetail", { host: failure.hostId, reason: failure.reason })}
+										</li>
+									))}
+								</ul>
+							</div>
+						</div>
 					</div>
 				) : null}
 				{allQuery.isError && isEmpty ? (
