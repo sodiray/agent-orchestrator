@@ -15,6 +15,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 )
 
@@ -23,7 +24,7 @@ const (
 	maxRemoteJSONResponseSize = 32 << 20
 )
 
-var errRemoteRedirect = errors.New("remote daemon redirects are not allowed")
+var errRemoteRedirect = remotedaemonhttp.ErrRedirect
 
 var remoteRequestHeaderAllowlist = []string{
 	"Accept",
@@ -61,12 +62,7 @@ func newSessionProxy(federation *federationsvc.Service) *sessionProxy {
 }
 
 func newRemoteDaemonClient(timeout time.Duration) *http.Client {
-	return &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return errRemoteRedirect
-		},
-	}
+	return remotedaemonhttp.NewClient(timeout)
 }
 
 // Middleware forwards only qualified session-bearing operations. Bare local
@@ -224,10 +220,14 @@ func (p *sessionProxy) markRemoteHostNotificationsRead(ctx context.Context, host
 	}
 	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
+		if errors.Is(err, errRemoteRedirect) {
+			p.log.Warn("remote notification acknowledgement redirect refused", "hostId", host.HostID, "address", host.Address, "reason", errRemoteRedirect.Error())
+		}
 		return 0, fmt.Errorf("request remote notification acknowledgement for %q: %w", host.HostID, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if isRedirect(resp.StatusCode) {
+		p.log.Warn("remote notification acknowledgement redirect refused", "hostId", host.HostID, "address", host.Address, "reason", errRemoteRedirect.Error())
 		return 0, errRemoteRedirect
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/cdc"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 )
 
@@ -287,6 +289,29 @@ func TestEventsRemoteFanInIsNoOpWithoutRegisteredHosts(t *testing.T) {
 	}
 }
 
+func TestEventsRemoteFanInRefusesRedirectFromInjectedClient(t *testing.T) {
+	targetRequests := make(chan struct{}, 1)
+	controller := &EventsController{Client: &http.Client{
+		Transport: eventRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "target.example" {
+				targetRequests <- struct{}{}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			}
+			return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{"http://target.example"}}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+		}),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+	}}
+	err := controller.readRemoteEvents(context.Background(), domain.RemoteHost{HostID: "workstation", Address: "remote.example"}, 0, true, func(cdc.Event) error { return nil })
+	if !errors.Is(err, remotedaemonhttp.ErrRedirect) {
+		t.Fatalf("readRemoteEvents() error = %v, want refused redirect", err)
+	}
+	select {
+	case <-targetRequests:
+		t.Fatal("remote event fan-in followed remote redirect")
+	default:
+	}
+}
+
 func TestRemoteEventFanInReconnectsAfterDroppedStream(t *testing.T) {
 	type remoteRequest struct {
 		after string
@@ -422,6 +447,12 @@ func readSSEIDs(t *testing.T, r io.Reader, want int) []string {
 	}
 	t.Fatalf("stream ended after ids %v, want %d ids", ids, want)
 	return nil
+}
+
+type eventRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f eventRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 // dedupeEventSource publishes a duplicate of its replay event plus a new event

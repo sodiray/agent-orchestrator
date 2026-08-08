@@ -11,6 +11,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 )
 
@@ -118,7 +119,7 @@ func (r *terminalMuxRelay) remote(ctx context.Context, hostID domain.RemoteHostI
 		return nil, fmt.Errorf("remote host is %s", host.OperatorState)
 	}
 	endpoint := "ws://" + host.Address + "/mux"
-	conn, _, err := websocket.Dial(ctx, endpoint, nil) // #nosec G704 -- target is a registered remote-host endpoint.
+	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: remotedaemonhttp.NewClient(0)}) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
 		return nil, fmt.Errorf("connect remote mux: %w", err)
 	}

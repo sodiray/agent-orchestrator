@@ -2,7 +2,9 @@ package remotedaemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 )
 
 func TestHTTPProberAcceptsExpectedDaemon(t *testing.T) {
@@ -34,6 +37,20 @@ func TestHTTPProberRejectsUnexpectedService(t *testing.T) {
 	err := NewHTTPProber(nil, 0).Probe(context.Background(), strings.TrimPrefix(srv.URL, "http://"))
 	if err == nil || !strings.Contains(err.Error(), "unexpected service") {
 		t.Fatalf("probe error = %v, want unexpected service", err)
+	}
+}
+
+func TestHTTPProberRefusesRemoteRedirect(t *testing.T) {
+	targetRequests := make(chan struct{}, 1)
+	client := redirectingClient(targetRequests)
+	err := NewHTTPProber(client, 0).Probe(context.Background(), "remote.example")
+	if !errors.Is(err, remotedaemonhttp.ErrRedirect) {
+		t.Fatalf("Probe() error = %v, want refused redirect", err)
+	}
+	select {
+	case <-targetRequests:
+		t.Fatal("health probe followed remote redirect")
+	default:
 	}
 }
 
@@ -63,6 +80,20 @@ func TestHTTPSessionListerReadsNativeSessionViews(t *testing.T) {
 	}
 }
 
+func TestHTTPSessionListerRefusesRemoteRedirect(t *testing.T) {
+	targetRequests := make(chan struct{}, 1)
+	client := redirectingClient(targetRequests)
+	_, err := NewHTTPSessionLister(client, 0).ListSessions(context.Background(), "remote.example", ports.RemoteSessionListFilter{})
+	if !errors.Is(err, remotedaemonhttp.ErrRedirect) {
+		t.Fatalf("ListSessions() error = %v, want refused redirect", err)
+	}
+	select {
+	case <-targetRequests:
+		t.Fatal("session lister followed remote redirect")
+	default:
+	}
+}
+
 func TestHTTPSessionListerReadsNativeNotifications(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/notifications" || r.URL.Query().Get("status") != "unread" || r.URL.Query().Get("limit") != "10" {
@@ -84,3 +115,22 @@ func TestHTTPSessionListerReadsNativeNotifications(t *testing.T) {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+func redirectingClient(targetRequests chan<- struct{}) *http.Client {
+	return &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "target.example" {
+				targetRequests <- struct{}{}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}")), Request: req}, nil
+			}
+			return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{"http://target.example"}}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+		}),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}

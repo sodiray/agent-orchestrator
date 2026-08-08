@@ -57,6 +57,17 @@ cannot presently be operated. It must not silently turn an unreachable host into
 a deleted session, nor infer that its runtime is dead from a failed reachability
 probe.
 
+## Probe scheduling is bounded
+
+Health probes run concurrently through a bounded worker pool, with a timeout
+per host. A blackholed host must not delay another host's successful recovery
+from becoming visible, while the bound prevents a large registry from creating
+unlimited probe work.
+
+The probe worker is demand-driven: it does not start until the first remote
+host is registered and stops after the last is removed. The zero-remote-hosts
+path performs no background probe work or registry reads.
+
 ## Recovery and operator boundary
 
 When a stopped host returns, its own daemon reconciles its runtimes and durable

@@ -51,6 +51,41 @@ This prevents a session on one host from shadowing a same-named session on
 another host and prevents a terminal stream from being routed to the wrong
 machine.
 
+## Proxy contract
+
+The proxy is a deliberately narrow translation boundary between the local API
+and an owning daemon. It forwards a session-bearing operation only after
+resolving the qualified identity to its registered host, removes the host
+qualification only for that owner-side request, and restores qualification in
+the response presented to the local client.
+
+Only a small allowlist of request headers crosses this boundary. Credentials,
+cookies, and origin or control headers are never forwarded. This is an
+allowlist rather than a denylist because a denylist fails open as soon as a
+new, security-relevant header is not on it.
+
+Every client used to reach a remote daemon refuses redirects outright,
+including bounded, streaming, and terminal connections. Remote addresses are
+normally forwarded loopback ports; a redirect could otherwise turn a request
+toward the local daemon's own services. A remote daemon is therefore not
+allowed to choose a second destination on the local daemon's behalf.
+
+Identity qualification happens at the response boundary, not just while
+assembling session lists. Every returned session reference is qualified,
+including nested references and terminal handles, before a client can reuse
+it. This keeps a follow-up action attached to the owning machine even when a
+response contains a session relationship rather than a top-level session.
+
+A remote session's preview URL is omitted. Its un-rewritten port would resolve
+on the operator's machine, not on the owning machine, and a link to the wrong
+machine is worse than no link. A routed preview surface is required before
+remote previews can be exposed.
+
+Routing is based on session-bearing operations, rather than treating the
+uniform `/sessions/{sessionId}/` shape as universal. Most operations use that
+shape, but some session-bearing operations do not. Treating the prefix as a
+complete routing rule would silently resolve a qualified id locally.
+
 ## Reads, writes, and events
 
 Federation is not a read-only board. For a remote session, the local daemon
@@ -69,6 +104,14 @@ local client is connected to that event surface, the local daemon keeps a
 subscription to each reachable remote daemon and reconnects a dropped remote
 stream with backoff. A remote outage is logged but does not end the local
 stream.
+
+The first subscription to a remote event stream begins at its current tail,
+then reconnects after the last remote sequence that was forwarded. This avoids
+replaying a remote daemon's entire history to every new local subscriber. That
+old behavior could fill the shared buffer, cancel the local stream, reconnect,
+and replay again: a livelock that became worse the longer a host had been in
+use. If a remote buffer is full, the local daemon backpressures that remote
+socket instead of cancelling the local stream.
 
 The local database does not copy a remote daemon's schema or derive remote
 status. It does retain an opaque, last-known session view in
@@ -101,6 +144,30 @@ flowchart LR
 owning remote daemon's lifecycle flow, then carried as part of its read model
 and events. The local daemon displays the owning daemon's derived display
 status; it does not invent a separate remote status reducer.
+
+## Notification federation
+
+Notification lists combine the local list with every registered remote owner's
+list concurrently. Each remote read has its own timeout, so an unavailable
+host cannot delay usable notification results from the others.
+
+A host whose notification list cannot be read is returned as an explicit
+remote failure with that host's reason; it is never folded into a calm,
+apparently complete bell. An empty bell can mean either that nothing needs the
+operator or that the host could not be asked. Only the first is safe to
+believe, which is why partial failure is part of the list contract.
+
+Notification ids are host-qualified, as are the embedded session references in
+their targets. A notification action therefore resolves to its owner, and
+opening a notification cannot surface a same-named session on another machine.
+Notification mutations use the existing session proxy's host resolution and
+forwarding path rather than creating a second remote mutation path.
+
+Notification streaming is intentionally live-only. Unlike session events, it
+has no durable cursor: fan-in subscribes at the remote tail and reconnects
+safely, but cannot replay notifications missed while disconnected. Refreshing
+the aggregated notification list is the recovery mechanism for that gap; the
+stream must not be mistaken for a complete history.
 
 ## Terminal paths
 

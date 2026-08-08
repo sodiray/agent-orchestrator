@@ -13,6 +13,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 )
 
 const DefaultProbeTimeout = 2 * time.Second
@@ -34,13 +35,10 @@ var _ ports.RemoteDaemonSessionLister = (*HTTPSessionLister)(nil)
 var _ ports.RemoteDaemonNotificationLister = (*HTTPSessionLister)(nil)
 
 func NewHTTPSessionLister(client *http.Client, timeout time.Duration) *HTTPSessionLister {
-	if client == nil {
-		client = &http.Client{}
-	}
 	if timeout <= 0 {
 		timeout = DefaultSessionListTimeout
 	}
-	return &HTTPSessionLister{client: client, timeout: timeout}
+	return &HTTPSessionLister{client: remotedaemonhttp.EnforceRedirectRefusal(client), timeout: timeout}
 }
 
 func (l *HTTPSessionLister) ListSessions(ctx context.Context, address string, filter ports.RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error) {
@@ -173,13 +171,10 @@ func remoteSessionQuery(filter ports.RemoteSessionListFilter) url.Values {
 }
 
 func NewHTTPProber(client *http.Client, timeout time.Duration) *HTTPProber {
-	if client == nil {
-		client = &http.Client{}
-	}
 	if timeout <= 0 {
 		timeout = DefaultProbeTimeout
 	}
-	return &HTTPProber{client: client, timeout: timeout}
+	return &HTTPProber{client: remotedaemonhttp.EnforceRedirectRefusal(client), timeout: timeout}
 }
 
 func (p *HTTPProber) Probe(ctx context.Context, address string) error {

@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 )
 
@@ -234,10 +235,7 @@ func (c *EventsController) readRemoteEvents(ctx context.Context, host domain.Rem
 }
 
 func (c *EventsController) client() *http.Client {
-	if c.Client != nil {
-		return c.Client
-	}
-	return http.DefaultClient
+	return remotedaemonhttp.EnforceRedirectRefusal(c.Client)
 }
 
 func (c *EventsController) logger() *slog.Logger {
