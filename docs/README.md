@@ -20,6 +20,7 @@ Start with [architecture.md](architecture.md) for the current backend model and
 | [stack.md](stack.md)                                   | Accepted library/runtime choices, pending stack decisions, and dependencies explicitly avoided for V1.                |
 | [telemetry.md](telemetry.md)                           | Telemetry collection, privacy safeguards, configuration, and PostHog dashboard guidance.                              |
 | [posthog-cost-controls.md](posthog-cost-controls.md)   | PostHog event-name migration, ingestion drop rules, and dashboard queries for reducing telemetry spend.              |
+| [remote-hosts/README.md](remote-hosts/README.md)       | High-level architecture for federating sessions from independently running remote daemons.                            |
 
 ## Mental model
 
