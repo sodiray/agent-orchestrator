@@ -252,7 +252,8 @@ func Run() error {
 	lifecycleMessenger.Bind(sessMgr)
 	lcStack.LCM.SetCompletionTerminator(sessMgr)
 	projectSvc := projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink})
-	remoteHostSvc := remotehostsvc.New(remotehostsvc.Deps{Store: store, Prober: remotedaemon.NewHTTPProber(nil, 0), Logger: log})
+	remoteSessionLister := remotedaemon.NewHTTPSessionLister(nil, 0)
+	remoteHostSvc := remotehostsvc.New(remotehostsvc.Deps{Store: store, Prober: remotedaemon.NewHTTPProber(nil, 0), SessionLister: remoteSessionLister, Logger: log})
 	if err := remoteHostSvc.LoadPresence(ctx); err != nil {
 		return fmt.Errorf("load remote host presence: %w", err)
 	}
@@ -260,7 +261,7 @@ func Run() error {
 		Local:              sessionSvc,
 		Store:              store,
 		Presence:           remoteHostSvc,
-		Client:             remotedaemon.NewHTTPSessionLister(nil, 0),
+		Client:             remoteSessionLister,
 		Notifications:      notifier,
 		NotificationClient: remotedaemon.NewHTTPSessionLister(nil, 0),
 		Logger:             log,

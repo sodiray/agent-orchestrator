@@ -139,8 +139,8 @@ func TestListAddsReachableRemoteSessions(t *testing.T) {
 	if remote.HostID != host.HostID || remote.SessionID != "remote-7" || !remote.Available {
 		t.Fatalf("remote = %#v", remote)
 	}
-	if got := store.snapshots[host.HostID]; len(got) != 1 || got[0].ObservedAt.IsZero() {
-		t.Fatalf("snapshots = %#v", got)
+	if got := store.snapshots[host.HostID]; len(got) != 0 {
+		t.Fatalf("board list refreshed snapshots = %#v", got)
 	}
 }
 

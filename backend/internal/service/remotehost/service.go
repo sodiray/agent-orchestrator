@@ -26,6 +26,7 @@ type Store interface {
 	ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error)
 	GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error)
 	RecordRemoteHostProbe(ctx context.Context, id domain.RemoteHostID, at time.Time, succeeded bool, failureReason string) (bool, error)
+	ReplaceRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot) error
 	SetRemoteHostOperatorState(ctx context.Context, id domain.RemoteHostID, state domain.RemoteHostState, at time.Time) (domain.RemoteHost, bool, error)
 	DeleteRemoteHost(ctx context.Context, id domain.RemoteHostID) (bool, error)
 }
@@ -57,19 +58,21 @@ type Host struct {
 }
 
 type Deps struct {
-	Store        Store
-	Prober       ports.RemoteDaemonProber
-	Clock        func() time.Time
-	Logger       *slog.Logger
-	ProbeTimeout time.Duration
+	Store         Store
+	Prober        ports.RemoteDaemonProber
+	SessionLister ports.RemoteDaemonSessionLister
+	Clock         func() time.Time
+	Logger        *slog.Logger
+	ProbeTimeout  time.Duration
 }
 
 type Service struct {
-	store  Store
-	prober ports.RemoteDaemonProber
-	clock  func() time.Time
-	log    *slog.Logger
-	count  atomic.Int64
+	store         Store
+	prober        ports.RemoteDaemonProber
+	sessionLister ports.RemoteDaemonSessionLister
+	clock         func() time.Time
+	log           *slog.Logger
+	count         atomic.Int64
 
 	probeTimeout  time.Duration
 	probeMu       sync.Mutex
@@ -98,7 +101,7 @@ func New(deps Deps) *Service {
 	if probeTimeout <= 0 {
 		probeTimeout = DefaultProbeTimeout
 	}
-	return &Service{store: deps.Store, prober: deps.Prober, clock: clock, log: log, probeTimeout: probeTimeout}
+	return &Service{store: deps.Store, prober: deps.Prober, sessionLister: deps.SessionLister, clock: clock, log: log, probeTimeout: probeTimeout}
 }
 
 // LoadPresence initializes the in-memory registered-host count during daemon
@@ -372,8 +375,8 @@ func (s *Service) probe(ctx context.Context, host domain.RemoteHost) (Host, erro
 		return Host{}, apierr.Internal("REMOTE_HOST_PROBER_UNAVAILABLE", "Remote host health probing is unavailable")
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+	defer cancel()
 	err := s.prober.Probe(probeCtx, host.Address)
-	cancel()
 	if ctx.Err() != nil {
 		s.log.Info("remote host health probe canceled", "hostId", host.HostID, "address", host.Address, "reason", ctx.Err())
 		return Host{}, ctx.Err()
@@ -396,7 +399,29 @@ func (s *Service) probe(ctx context.Context, host domain.RemoteHost) (Host, erro
 	host.LastProbeSucceeded = err == nil
 	host.LastProbeError = failureReason
 	host.UpdatedAt = now
+	if err == nil {
+		s.refreshSnapshots(probeCtx, host, now)
+	}
 	return hostView(host), nil
+}
+
+func (s *Service) refreshSnapshots(ctx context.Context, host domain.RemoteHost, observedAt time.Time) {
+	if s.sessionLister == nil {
+		s.log.Error("remote session snapshot refresh unavailable", "hostId", host.HostID, "reason", "remote session lister is unavailable")
+		return
+	}
+	snapshots, err := s.sessionLister.ListSessions(ctx, host.Address, ports.RemoteSessionListFilter{})
+	if err != nil {
+		s.log.Warn("remote session snapshot refresh failed", "hostId", host.HostID, "address", host.Address, "err", err)
+		return
+	}
+	for index := range snapshots {
+		snapshots[index].HostID = host.HostID
+		snapshots[index].ObservedAt = observedAt
+	}
+	if err := s.store.ReplaceRemoteSessionSnapshots(ctx, host.HostID, snapshots); err != nil {
+		s.log.Error("store remote session snapshots failed", "hostId", host.HostID, "err", err)
+	}
 }
 
 func hostView(host domain.RemoteHost) Host {

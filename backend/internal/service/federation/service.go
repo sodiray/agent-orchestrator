@@ -29,7 +29,6 @@ type LocalNotifications interface {
 type RemoteHostStore interface {
 	ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error)
 	GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error)
-	ReplaceRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot) error
 	ListRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID) ([]domain.RemoteSessionSnapshot, error)
 }
 
@@ -47,7 +46,6 @@ type Deps struct {
 	Notifications      LocalNotifications
 	NotificationClient ports.RemoteDaemonNotificationLister
 	Timeout            time.Duration
-	Clock              func() time.Time
 	Logger             *slog.Logger
 }
 
@@ -59,7 +57,6 @@ type Service struct {
 	notifications      LocalNotifications
 	notificationClient ports.RemoteDaemonNotificationLister
 	timeout            time.Duration
-	clock              func() time.Time
 	log                *slog.Logger
 }
 
@@ -81,10 +78,6 @@ func New(deps Deps) *Service {
 	if timeout <= 0 {
 		timeout = DefaultListTimeout
 	}
-	clock := deps.Clock
-	if clock == nil {
-		clock = time.Now
-	}
 	log := deps.Logger
 	if log == nil {
 		log = slog.Default()
@@ -97,7 +90,6 @@ func New(deps Deps) *Service {
 		notifications:      deps.Notifications,
 		notificationClient: deps.NotificationClient,
 		timeout:            timeout,
-		clock:              clock,
 		log:                log,
 	}
 }
@@ -298,14 +290,6 @@ func (s *Service) listHost(ctx context.Context, host domain.RemoteHost, filter s
 		reason := err.Error()
 		s.log.Warn("remote session list failed", "hostId", host.HostID, "address", host.Address, "err", err)
 		return s.unavailableSnapshots(ctx, host, reason)
-	}
-	observedAt := s.clock().UTC()
-	for index := range snapshots {
-		snapshots[index].HostID = host.HostID
-		snapshots[index].ObservedAt = observedAt
-	}
-	if err := s.store.ReplaceRemoteSessionSnapshots(ctx, host.HostID, snapshots); err != nil {
-		s.log.Error("store remote session snapshots failed", "hostId", host.HostID, "err", err)
 	}
 	return availableSnapshots(host.HostID, snapshots)
 }

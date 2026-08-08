@@ -115,7 +115,8 @@ socket instead of cancelling the local stream.
 
 The local database does not copy a remote daemon's schema or derive remote
 status. It does retain an opaque, last-known session view in
-`remote_session_snapshots` after a successful remote list. That small cache
+`remote_session_snapshots` after each successful owner-driven health refresh,
+including the initial successful probe during registration. That small cache
 lets the board explain a remote session after a local restart while its owner
 is unavailable, instead of silently making the session disappear. Its display
 status and `activity_state` are still always the owning daemon's values; the

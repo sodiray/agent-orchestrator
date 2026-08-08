@@ -60,9 +60,13 @@ probe.
 ## Probe scheduling is bounded
 
 Health probes run concurrently through a bounded worker pool, with a timeout
-per host. A blackholed host must not delay another host's successful recovery
-from becoming visible, while the bound prevents a large registry from creating
-unlimited probe work.
+per host. A successful probe also refreshes that host's complete opaque session
+snapshot before the timeout expires, including the immediate probe performed
+when a host is registered. This adds one native session-list request per
+reachable host per probe interval; it is not driven by board clients. A
+blackholed or slow host must not delay another host's successful recovery or
+snapshot refresh from becoming visible, while the bound prevents a large
+registry from creating unlimited probe work.
 
 The probe worker is demand-driven: it does not start until the first remote
 host is registered and stops after the last is removed. The zero-remote-hosts
