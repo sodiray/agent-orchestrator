@@ -52,6 +52,7 @@ describe("ChatWorkspace timeline", () => {
 		expect(screen.getByTestId("session-workspace-topbar")).toBeInTheDocument();
 		expect(screen.getByTestId("session-terminal-region")).toBeInTheDocument();
 		expect(screen.getByRole("tab", { name: chatFixture.title })).toBeInTheDocument();
+		expect(screen.getByText("Chat · no agent terminal")).toBeInTheDocument();
 
 		view.rerender(<ChatWorkspace snapshot={chatFixture} sessionRole="orchestrator" />);
 

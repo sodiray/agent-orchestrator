@@ -637,6 +637,7 @@ function ChatHeader({
 									>
 										<span className="truncate">{label}</span>
 									</button>
+									<span className="shrink-0 text-micro text-muted-foreground">Chat · no agent terminal</span>
 								</span>
 							</div>
 							<Button

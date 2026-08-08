@@ -34,7 +34,7 @@ import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { hidesShellTopbar } from "../lib/platform";
 import { useShell } from "../lib/shell-context";
 import { cn } from "../lib/utils";
-import { isOrchestratorSession, sessionIsActive } from "../types/workspace";
+import { isOrchestratorSession, sessionIsActive, sessionIsUnavailable } from "../types/workspace";
 import { terminalTargetBelongsToSession, type TerminalTarget } from "../types/terminal";
 import { matchesRendererShortcut } from "../stores/keybindings-store";
 import { useResolvedTheme, useUiStore, type InspectorView } from "../stores/ui-store";
@@ -563,6 +563,42 @@ export function SessionView({ sessionId }: SessionViewProps) {
 		return (
 			<div className="grid h-full place-items-center p-6 text-center font-mono text-xs text-passive">
 				{t("session.notFound")}
+			</div>
+		);
+	}
+	if (session && sessionIsUnavailable(session)) {
+		const host = session.hostLabel ?? session.hostId ?? t("remoteHost.host");
+		const reason =
+			session.unavailableReason ??
+			(session.hostState === "stopped"
+				? t("remoteHost.stoppedDetail")
+				: session.hostState === "destroyed"
+					? t("remoteHost.destroyedDetail")
+					: t("remoteHost.unavailable"));
+		const recoveryDetail =
+			session.hostState === "stopped"
+				? t("remoteHost.stoppedDetail")
+				: session.hostState === "destroyed"
+					? t("remoteHost.destroyedDetail")
+					: undefined;
+		return (
+			<div className="grid h-full place-items-center bg-background p-6 text-center text-foreground" data-testid="session-unavailable">
+				<div
+					className={cn(
+						"max-w-md rounded-lg border px-5 py-4",
+						session.hostState === "destroyed"
+							? "border-destructive/50 bg-destructive/5"
+							: "border-warning/50 bg-warning/5",
+					)}
+					role="alert"
+				>
+					<div className="font-medium">{t("remoteHost.unavailable")}</div>
+					<div className="mt-1 text-sm font-semibold">{session.title}</div>
+					<p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+						{t("remoteHost.unavailableDetail", { host, reason })}
+					</p>
+					{recoveryDetail ? <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{recoveryDetail}</p> : null}
+				</div>
 			</div>
 		);
 	}

@@ -20,6 +20,7 @@ import {
 	hasConfiguredOrchestratorAgent,
 	newestActiveOrchestrator,
 	orchestratorHealth,
+	sessionIsUnavailable,
 	workerSessions,
 } from "../types/workspace";
 import {
@@ -104,6 +105,7 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 	// Same crumb as ShellTopbar: project name in scope, else root-board "Board".
 	const boardLabel = workspace?.name ?? (projectId ? "" : t("shell.board"));
 	const sessions = workspaces.flatMap((w) => workerSessions(w.sessions));
+	const groupByHost = sessions.some((session) => session.hostId !== undefined);
 	const orchestrator = projectId ? newestActiveOrchestrator(workspaces[0]?.sessions ?? []) : undefined;
 	const orchestratorActivityLabel = orchestrator ? getAgentActivityView(orchestrator.activity, t).label : undefined;
 	const [isSpawning, setIsSpawning] = useState(false);
@@ -379,6 +381,7 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 									sessions={byZone.get(col.zone) ?? []}
 									onOpen={openSession}
 									onTerminate={(session) => terminateSession.mutate(session)}
+									groupByHost={groupByHost}
 									usageBySession={usageBySession}
 								/>
 							))}
@@ -458,12 +461,14 @@ function BoardColumn({
 	sessions,
 	onOpen,
 	onTerminate,
+	groupByHost,
 	usageBySession,
 }: {
 	col: Column;
 	sessions: WorkspaceSession[];
 	onOpen: (s: WorkspaceSession) => void;
 	onTerminate: (s: WorkspaceSession) => void;
+	groupByHost: boolean;
 	usageBySession: UsageBySession;
 }) {
 	if (col.zone === "working") {
@@ -472,6 +477,7 @@ function BoardColumn({
 				sessions={sessions}
 				onOpen={onOpen}
 				onTerminate={onTerminate}
+				groupByHost={groupByHost}
 				usageBySession={usageBySession}
 			/>
 		);
@@ -482,6 +488,7 @@ function BoardColumn({
 				sessions={sessions}
 				onOpen={onOpen}
 				onTerminate={onTerminate}
+				groupByHost={groupByHost}
 				usageBySession={usageBySession}
 			/>
 		);
@@ -492,6 +499,7 @@ function BoardColumn({
 			sessions={sessions}
 			onOpen={onOpen}
 			onTerminate={onTerminate}
+			groupByHost={groupByHost}
 			usageBySession={usageBySession}
 		/>
 	);
@@ -502,12 +510,14 @@ function ZoneColumn({
 	sessions,
 	onOpen,
 	onTerminate,
+	groupByHost,
 	usageBySession,
 }: {
 	col: Column;
 	sessions: WorkspaceSession[];
 	onOpen: (s: WorkspaceSession) => void;
 	onTerminate: (s: WorkspaceSession) => void;
+	groupByHost: boolean;
 	usageBySession: UsageBySession;
 }) {
 	const { t } = useTranslation();
@@ -532,17 +542,14 @@ function ZoneColumn({
 				<span className="ml-auto font-mono text-2xs leading-none text-passive">{sessions.length}</span>
 			</div>
 			<div className="board-scrollbar min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-3">
-				<div className="flex min-h-full flex-col gap-2.5">
-					{sessions.map((session) => (
-						<SessionCard
-							key={session.id}
-							session={session}
-							onOpen={() => onOpen(session)}
-							onTerminate={() => onTerminate(session)}
-							usage={usageBySession.get(session.id)}
-						/>
-					))}
-				</div>
+				<SessionCardList
+					className="flex min-h-full flex-col gap-2.5"
+					groupByHost={groupByHost}
+					onOpen={onOpen}
+					onTerminate={onTerminate}
+					sessions={sessions}
+					usageBySession={usageBySession}
+				/>
 			</div>
 		</section>
 	);
@@ -608,11 +615,13 @@ function WorkLaneColumn({
 	sessions,
 	onOpen,
 	onTerminate,
+	groupByHost,
 	usageBySession,
 }: {
 	sessions: WorkspaceSession[];
 	onOpen: (s: WorkspaceSession) => void;
 	onTerminate: (s: WorkspaceSession) => void;
+	groupByHost: boolean;
 	usageBySession: UsageBySession;
 }) {
 	const { t } = useTranslation();
@@ -630,6 +639,7 @@ function WorkLaneColumn({
 			secondaryTone={tones.working}
 			onOpen={onOpen}
 			onTerminate={onTerminate}
+			groupByHost={groupByHost}
 			usageBySession={usageBySession}
 		/>
 	);
@@ -639,11 +649,13 @@ function MergeLaneColumn({
 	sessions,
 	onOpen,
 	onTerminate,
+	groupByHost,
 	usageBySession,
 }: {
 	sessions: WorkspaceSession[];
 	onOpen: (s: WorkspaceSession) => void;
 	onTerminate: (s: WorkspaceSession) => void;
+	groupByHost: boolean;
 	usageBySession: UsageBySession;
 }) {
 	const { t } = useTranslation();
@@ -665,6 +677,7 @@ function MergeLaneColumn({
 			secondaryTone={tones.merged}
 			onOpen={onOpen}
 			onTerminate={onTerminate}
+			groupByHost={groupByHost}
 			usageBySession={usageBySession}
 		/>
 	);
@@ -679,6 +692,7 @@ function SplitLaneColumn({
 	secondaryTone,
 	onOpen,
 	onTerminate,
+	groupByHost,
 	usageBySession,
 }: {
 	ariaLabel: string;
@@ -689,6 +703,7 @@ function SplitLaneColumn({
 	secondaryTone: SplitLaneTone;
 	onOpen: (s: WorkspaceSession) => void;
 	onTerminate: (s: WorkspaceSession) => void;
+	groupByHost: boolean;
 	usageBySession: UsageBySession;
 }) {
 	const { t } = useTranslation();
@@ -728,17 +743,14 @@ function SplitLaneColumn({
 							className={cn("flex flex-col", showSecondary ? "flex-none pb-3" : "flex-1")}
 							role="region"
 						>
-							<div className="flex flex-col gap-2.5">
-								{primarySessions.map((session) => (
-									<SessionCard
-										key={session.id}
-										session={session}
-										onOpen={() => onOpen(session)}
-										onTerminate={() => onTerminate(session)}
-										usage={usageBySession.get(session.id)}
-									/>
-								))}
-							</div>
+							<SessionCardList
+								className="flex flex-col gap-2.5"
+								groupByHost={groupByHost}
+								onOpen={onOpen}
+								onTerminate={onTerminate}
+								sessions={primarySessions}
+								usageBySession={usageBySession}
+							/>
 						</div>
 					) : null}
 					{showSecondary ? (
@@ -748,6 +760,7 @@ function SplitLaneColumn({
 							tone={secondaryTone}
 							onOpen={onOpen}
 							onTerminate={onTerminate}
+							groupByHost={groupByHost}
 							usageBySession={usageBySession}
 						/>
 					) : null}
@@ -775,10 +788,108 @@ function SessionCount({ count, label }: { count: number; label: string }) {
 	return <span aria-label={t("shell.countSessionsAria", { count, label })}>{count}</span>;
 }
 
+type HostSessionGroup = {
+	hostId?: string;
+	label: string;
+	sessions: WorkspaceSession[];
+};
+
+function SessionCardList({
+	className,
+	groupByHost,
+	onOpen,
+	onTerminate,
+	sessions,
+	usageBySession,
+}: {
+	className: string;
+	groupByHost: boolean;
+	onOpen: (session: WorkspaceSession) => void;
+	onTerminate?: (session: WorkspaceSession) => void;
+	sessions: WorkspaceSession[];
+	usageBySession: UsageBySession;
+}) {
+	const { t } = useTranslation();
+	const cards = (items: WorkspaceSession[]) =>
+		items.map((session) => (
+			<SessionCard
+				key={session.id}
+				onOpen={() => onOpen(session)}
+				onTerminate={onTerminate ? () => onTerminate(session) : undefined}
+				session={session}
+				usage={usageBySession.get(session.id)}
+			/>
+		));
+	if (!groupByHost) return <div className={className}>{cards(sessions)}</div>;
+
+	const groups = new Map<string, HostSessionGroup>();
+	for (const session of sessions) {
+		const key = session.hostId ?? "local";
+		const current = groups.get(key);
+		if (current) {
+			current.sessions.push(session);
+			continue;
+		}
+		groups.set(key, {
+			hostId: session.hostId,
+			label: session.hostLabel ?? session.hostId ?? t("remoteHost.local"),
+			sessions: [session],
+		});
+	}
+	const sortedGroups = [...groups.values()].sort((left, right) => {
+		if (!left.hostId) return -1;
+		if (!right.hostId) return 1;
+		return left.label.localeCompare(right.label);
+	});
+
+	return (
+		<div className={cn(className, "gap-4")}>
+			{sortedGroups.map((group) => (
+				<section aria-label={group.hostId ? `${t("remoteHost.host")} ${group.label}` : t("remoteHost.local")} key={group.hostId ?? "local"}>
+					<HostGroupHeader group={group} />
+					<div className="mt-2 flex flex-col gap-2.5">{cards(group.sessions)}</div>
+				</section>
+			))}
+		</div>
+	);
+}
+
+function HostGroupHeader({ group }: { group: HostSessionGroup }) {
+	const { t } = useTranslation();
+	const unavailable = group.sessions.find(sessionIsUnavailable);
+	const state = unavailable?.hostState;
+	const stateLabel =
+		state === "stopped"
+			? t("remoteHost.stopped")
+			: state === "destroyed"
+				? t("remoteHost.destroyed")
+				: unavailable
+					? t("remoteHost.unavailable")
+					: undefined;
+	return (
+		<div
+			className={cn(
+				"flex items-center gap-2 border-b pb-1.5 font-mono text-micro font-medium uppercase tracking-wide-sm",
+				state === "destroyed"
+					? "border-destructive/40 text-destructive"
+					: state === "stopped"
+						? "border-warning/40 text-warning"
+						: unavailable
+							? "border-warning/30 text-warning"
+							: "border-border text-muted-foreground",
+			)}
+		>
+			<span>{group.hostId ? `${t("remoteHost.host")} · ${group.label}` : t("remoteHost.local")}</span>
+			{stateLabel ? <span className="ml-auto normal-case tracking-normal">{stateLabel}</span> : null}
+		</div>
+	);
+}
+
 function SecondaryLaneSection({
 	sessions,
 	onOpen,
 	onTerminate,
+	groupByHost,
 	standalone,
 	tone,
 	usageBySession,
@@ -786,6 +897,7 @@ function SecondaryLaneSection({
 	sessions: WorkspaceSession[];
 	onOpen: (s: WorkspaceSession) => void;
 	onTerminate?: (s: WorkspaceSession) => void;
+	groupByHost: boolean;
 	standalone: boolean;
 	tone: SplitLaneTone;
 	usageBySession: UsageBySession;
@@ -805,17 +917,14 @@ function SecondaryLaneSection({
 				</div>
 				<span className="ml-auto font-mono text-2xs leading-none text-passive">{sessions.length}</span>
 			</div>
-			<div className="flex flex-col gap-2.5 pt-3">
-				{sessions.map((session) => (
-					<SessionCard
-						key={session.id}
-						session={session}
-						onOpen={() => onOpen(session)}
-						onTerminate={onTerminate ? () => onTerminate(session) : undefined}
-						usage={usageBySession.get(session.id)}
-					/>
-				))}
-			</div>
+			<SessionCardList
+				className="flex flex-col gap-2.5 pt-3"
+				groupByHost={groupByHost}
+				onOpen={onOpen}
+				onTerminate={onTerminate}
+				sessions={sessions}
+				usageBySession={usageBySession}
+			/>
 		</div>
 	);
 }
@@ -847,10 +956,24 @@ function SessionCard({
 	const showLiveActivity = session.status === "working" && activity.state === "active";
 	const issueId = canonicalTrackerIssueId(session.issueId);
 	const branch = session.branch || "";
+	const unavailable = sessionIsUnavailable(session);
+	const unavailableStateLabel =
+		session.hostState === "stopped"
+			? t("remoteHost.stopped")
+			: session.hostState === "destroyed"
+				? t("remoteHost.destroyed")
+				: t("remoteHost.unavailable");
+	const unavailableReason =
+		session.unavailableReason ??
+		(session.hostState === "stopped"
+			? t("remoteHost.stoppedDetail")
+			: session.hostState === "destroyed"
+				? t("remoteHost.destroyedDetail")
+				: t("remoteHost.unavailable"));
 	const showBranch = branch !== "" && !sameLabel(branch, session.title) && !sameLabel(branch, session.id);
 	const prSummaries = sessionPRDisplaySummaries(session, useSessionScmSummary(session.id).data);
 	const termination = useTerminateSessionState(session.id);
-	const showTerminate = interactive && session.isTerminated !== true && onTerminate;
+	const showTerminate = interactive && !unavailable && session.isTerminated !== true && onTerminate;
 	const keepTerminateVisible = session.status === "merged";
 	const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
 		if (!interactive || !onOpen) return;
@@ -872,7 +995,11 @@ function SessionCard({
 			{...cardBodyProps}
 			className={cn(
 				"group relative w-full rounded-lg border text-left transition-[border-color,box-shadow]",
-				badge.cardClassName ?? "border-border bg-surface",
+				unavailable
+					? session.hostState === "destroyed"
+						? "border-destructive/50 bg-destructive/5"
+						: "border-warning/50 bg-warning/5"
+					: (badge.cardClassName ?? "border-border bg-surface"),
 				interactive && "cursor-pointer hover:border-border-strong hover:shadow-sm",
 			)}
 			data-testid="board-session-card"
@@ -978,6 +1105,22 @@ function SessionCard({
 						{issueId}
 					</span>
 				)}
+				{unavailable ? (
+					<div
+						className={cn(
+							"rounded-sm border px-2 py-1.5 text-2xs leading-relaxed",
+							session.hostState === "destroyed"
+								? "border-destructive/30 text-destructive"
+								: "border-warning/30 text-warning",
+						)}
+						role="status"
+					>
+						<div className="font-medium">
+							{session.hostLabel ?? session.hostId} · {unavailableStateLabel}
+						</div>
+						<div>{unavailableReason}</div>
+					</div>
+				) : null}
 			</div>
 			{termination.error ? (
 				<div className="border-t border-border px-3.5 py-1.5 text-2xs text-destructive" role="alert">
@@ -1005,7 +1148,7 @@ function ArchiveSessionItem({
 	usage?: SessionUsageSummary;
 }) {
 	const branch = session.branch || "";
-	const restoreButton = (
+	const restoreButton = sessionIsUnavailable(session) ? undefined : (
 		<ArchiveRestoreButton
 			isDisabled={isRestoreDisabled}
 			isRestoring={isRestoring}

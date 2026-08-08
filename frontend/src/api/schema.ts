@@ -502,6 +502,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/remote-hosts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List registered remote daemon hosts and their connection health */
+        get: operations["listRemoteHosts"];
+        put?: never;
+        /** Register a reachable remote daemon host */
+        post: operations["registerRemoteHost"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/remote-hosts/{hostId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one registered remote daemon host */
+        get: operations["getRemoteHost"];
+        put?: never;
+        post?: never;
+        /** Deregister a remote daemon host */
+        delete: operations["deregisterRemoteHost"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/remote-hosts/{hostId}/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Declare a remote host stopped or destroyed, or resume health probing */
+        patch: operations["updateRemoteHostState"];
+        trace?: never;
+    };
     "/api/v1/reviews/{reviewSessionID}/activity": {
         parameters: {
             query?: never;
@@ -1501,11 +1554,14 @@ export interface components {
         };
         ControllersSessionView: {
             activity: components["schemas"]["DomainActivity"];
+            /** @enum {string} */
+            availability?: "available" | "unavailable";
             branch?: string;
             /** Format: date-time */
             createdAt: string;
             displayName?: string;
             harness?: string;
+            hostId?: string;
             id: string;
             isPinned: boolean;
             isTerminated: boolean;
@@ -1528,6 +1584,7 @@ export interface components {
             status: "working" | "pr_open" | "draft" | "ci_failed" | "review_pending" | "changes_requested" | "approved" | "mergeable" | "merged" | "needs_input" | "exited" | "idle" | "terminated" | "no_signal";
             terminalHandleId?: string;
             terminateOnPrMerge: boolean;
+            unavailableReason?: string;
             /** Format: date-time */
             updatedAt: string;
         };
@@ -1771,6 +1828,9 @@ export interface components {
             orchestratorId?: string;
             workerId: string;
         };
+        DeregisterRemoteHostResponse: {
+            hostId: string;
+        };
         DevImportProjectsConflict: {
             path: string;
             projectId: string;
@@ -1851,6 +1911,9 @@ export interface components {
         };
         ListProjectsResponse: {
             projects: components["schemas"]["ProjectSummary"][];
+        };
+        ListRemoteHostsResponse: {
+            remoteHosts: components["schemas"]["RemoteHost"][];
         };
         ListReviewsResponse: {
             reviewerHandleId: string;
@@ -2054,8 +2117,30 @@ export interface components {
             /** @description Expo push token, e.g. ExponentPushToken[...]. */
             token: string;
         };
+        RegisterRemoteHostInput: {
+            address: string;
+            hostId: string;
+            label?: string;
+        };
         ReloadConversationMCPServersResponse: {
             servers: components["schemas"]["ConversationMCPServerPayload"][];
+        };
+        RemoteHost: {
+            address: string;
+            /** Format: date-time */
+            createdAt: string;
+            hostId: string;
+            label?: string;
+            /** Format: date-time */
+            lastProbeAt: string;
+            lastProbeError?: string;
+            lastProbeSucceeded: boolean;
+            state: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
+        RemoteHostResponse: {
+            remoteHost: components["schemas"]["RemoteHost"];
         };
         RemoveProjectResult: {
             projectId: string;
@@ -2494,6 +2579,10 @@ export interface components {
         UpdateProjectSettingsInput: {
             config: components["schemas"]["ProjectConfig"];
             displayName: string;
+        };
+        UpdateRemoteHostStateRequest: {
+            /** @enum {string} */
+            state: "available" | "stopped" | "destroyed";
         };
         UpdateSessionInterfaceRequest: {
             /** @enum {string} */
@@ -4255,6 +4344,294 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UnregisterPushDeviceResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    listRemoteHosts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListRemoteHostsResponse"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    registerRemoteHost: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterRemoteHostInput"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteHostResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    getRemoteHost: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Operator-supplied remote host identifier. */
+                hostId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteHostResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    deregisterRemoteHost: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Operator-supplied remote host identifier. */
+                hostId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeregisterRemoteHostResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    updateRemoteHostState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Operator-supplied remote host identifier. */
+                hostId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRemoteHostStateRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteHostResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
                 };
             };
             /** @description Internal Server Error */

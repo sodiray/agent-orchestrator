@@ -422,6 +422,11 @@ describe("SessionView", () => {
 			delete session.previewUrl;
 			delete session.previewRevision;
 			delete session.isTerminated;
+			delete session.hostId;
+			delete session.hostLabel;
+			delete session.hostState;
+			delete session.availability;
+			delete session.unavailableReason;
 			session.status = "working";
 			delete session.mode;
 			session.prs = [];
@@ -1190,5 +1195,21 @@ describe("SessionView", () => {
 		expect(inspectorButton()).toHaveAttribute("data-view", "summary");
 		expect(browserUnseen("sess-2")).toBe(true);
 		expect(handle.expand).not.toHaveBeenCalled();
+	});
+
+	it("explains an unavailable remote session without rendering terminal or session controls", () => {
+		const session = workerSession("sess-1");
+		session.hostId = "build-host";
+		session.hostLabel = "Build machine";
+		session.hostState = "stopped";
+		session.availability = "unavailable";
+		session.unavailableReason = "Host is stopped for maintenance";
+
+		render(<SessionView sessionId="sess-1" />);
+
+		expect(screen.getByTestId("session-unavailable")).toHaveTextContent("Build machine is unavailable");
+		expect(screen.getByTestId("session-unavailable")).toHaveTextContent("Stopped — reconnecting this host will restore access.");
+		expect(screen.queryByText("terminal center")).not.toBeInTheDocument();
+		expect(screen.queryByTestId("session-workspace-topbar")).not.toBeInTheDocument();
 	});
 });

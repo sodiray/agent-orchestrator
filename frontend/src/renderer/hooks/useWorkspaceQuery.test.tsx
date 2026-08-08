@@ -27,10 +27,12 @@ function wrapper({ children }: { children: ReactNode }) {
 function respondWith(payload: {
 	projects?: { data?: unknown; error?: unknown };
 	sessions?: { data?: unknown; error?: unknown };
+	remoteHosts?: { data?: unknown; error?: unknown };
 }) {
 	getMock.mockImplementation(async (url: string) => {
 		if (url === "/api/v1/projects") return payload.projects ?? { data: { projects: [] }, error: undefined };
 		if (url === "/api/v1/sessions") return payload.sessions ?? { data: { sessions: [] }, error: undefined };
+		if (url === "/api/v1/remote-hosts") return payload.remoteHosts ?? { data: { remoteHosts: [] }, error: undefined };
 		throw new Error(`unexpected GET ${url}`);
 	});
 }
@@ -142,6 +144,71 @@ describe("useWorkspaceQuery", () => {
 		expect(captureRendererEventMock).toHaveBeenCalledWith("ao.renderer.session_state_unknown", {
 			field: "activity",
 			reason: "missing",
+		});
+	});
+
+	it("does not request hosts when every session is local", async () => {
+		respondWith({
+			projects: { data: { projects: [{ id: "proj-1", name: "my-app", path: "/p" }] }, error: undefined },
+			sessions: {
+				data: {
+					sessions: [
+						{ id: "sess-1", projectId: "proj-1", status: "working", isTerminated: false, updatedAt: "2026-06-10T16:15:04Z" },
+					],
+				},
+				error: undefined,
+			},
+		});
+
+		const { result } = renderHook(() => useWorkspaceQuery(), { wrapper });
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+		expect(getMock).toHaveBeenCalledTimes(2);
+		expect(getMock).not.toHaveBeenCalledWith("/api/v1/remote-hosts");
+	});
+
+	it("maps remote host labels and unavailable session state", async () => {
+		respondWith({
+			projects: { data: { projects: [{ id: "proj-1", name: "my-app", path: "/p" }] }, error: undefined },
+			sessions: {
+				data: {
+					sessions: [
+						{
+							id: "build-host~sess-1",
+							hostId: "build-host",
+							terminalHandleId: "build-host~term-1",
+							projectId: "proj-1",
+							availability: "unavailable",
+							unavailableReason: "Host is stopped for maintenance",
+							status: "working",
+							isTerminated: false,
+							updatedAt: "2026-06-10T16:15:04Z",
+						},
+					],
+				},
+				error: undefined,
+			},
+			remoteHosts: {
+				data: {
+					remoteHosts: [
+						{ hostId: "build-host", label: "Build machine", address: "127.0.0.1:3001", state: "stopped" },
+					],
+				},
+				error: undefined,
+			},
+		});
+
+		const { result } = renderHook(() => useWorkspaceQuery(), { wrapper });
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+		expect(getMock).toHaveBeenCalledWith("/api/v1/remote-hosts");
+		expect(result.current.data?.[0].sessions[0]).toMatchObject({
+			hostId: "build-host",
+			terminalHandleId: "build-host~term-1",
+			hostLabel: "Build machine",
+			hostState: "stopped",
+			availability: "unavailable",
+			unavailableReason: "Host is stopped for maintenance",
 		});
 	});
 

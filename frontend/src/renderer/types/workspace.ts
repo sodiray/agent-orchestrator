@@ -123,9 +123,18 @@ export type PullRequestFacts = {
 /** The daemon-committed controller currently responsible for the session. */
 export type SessionMode = "chat" | "tui";
 
+export type RemoteHostState = "available" | "unreachable" | "stopped" | "destroyed";
+
 export type WorkspaceSession = {
 	id: string;
 	terminalHandleId?: string;
+	/** Present only for a session owned by a registered remote host. */
+	hostId?: string;
+	/** Operator-facing host label, resolved from the host registry. */
+	hostLabel?: string;
+	hostState?: RemoteHostState;
+	availability?: "available" | "unavailable";
+	unavailableReason?: string;
 	workspaceId: string;
 	workspaceName: string;
 	title: string;
@@ -179,6 +188,10 @@ export type WorkspaceSession = {
 	 */
 	prs: PullRequestFacts[];
 };
+
+export function sessionIsUnavailable(session: WorkspaceSession): boolean {
+	return session.availability === "unavailable";
+}
 
 // Tracker providers whose ids the intake daemon stamps sessions with, in
 // "<provider>:<native>" form. Adding a provider (Linear, Jira, ...) later is

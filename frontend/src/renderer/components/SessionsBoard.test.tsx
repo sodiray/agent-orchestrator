@@ -267,6 +267,52 @@ describe("SessionsBoard", () => {
 		expect(within(idleCard).getByText("brand-font-pipeline")).toHaveClass("font-semibold", "line-clamp-2");
 	});
 
+	it("groups local and remote sessions and makes unavailable hosts non-actionable", () => {
+		workspaceQueryMock.mockReturnValue({
+			data: [
+				workspaceWithSessions([
+					boardSession({ id: "local-1", title: "local worker", status: "working" }),
+					boardSession({
+						id: "build-host~stopped-1",
+						title: "recoverable worker",
+						status: "working",
+						hostId: "build-host",
+						hostLabel: "Build machine",
+						hostState: "stopped",
+						availability: "unavailable",
+						unavailableReason: "Host is stopped for maintenance",
+					}),
+					boardSession({
+						id: "archive-host~destroyed-1",
+						title: "final worker",
+						status: "working",
+						hostId: "archive-host",
+						hostLabel: "Archive machine",
+						hostState: "destroyed",
+						availability: "unavailable",
+						unavailableReason: "Host was permanently removed",
+					}),
+				]),
+			],
+			isError: false,
+			isSuccess: true,
+		});
+
+		renderBoard("p1");
+
+		expect(screen.getByText("Local")).toBeInTheDocument();
+		expect(screen.getByLabelText("Host Build machine")).toHaveTextContent("Stopped · recoverable");
+		expect(screen.getByLabelText("Host Archive machine")).toHaveTextContent("Destroyed · final");
+		const stoppedCard = screen.getByText("recoverable worker").closest('[data-testid="board-session-card"]') as HTMLElement;
+		const destroyedCard = screen.getByText("final worker").closest('[data-testid="board-session-card"]') as HTMLElement;
+		expect(within(stoppedCard).getByRole("status")).toHaveTextContent("Host is stopped for maintenance");
+		expect(within(destroyedCard).getByRole("status")).toHaveTextContent("Host was permanently removed");
+		expect(stoppedCard).toHaveClass("border-warning/50");
+		expect(destroyedCard).toHaveClass("border-destructive/50");
+		expect(within(stoppedCard).queryByRole("button", { name: "Terminate recoverable worker" })).not.toBeInTheDocument();
+		expect(within(destroyedCard).queryByRole("button", { name: "Terminate final worker" })).not.toBeInTheDocument();
+	});
+
 	it("shows compact token usage on active and archived cards and hides empty totals", async () => {
 		workspaceQueryMock.mockReturnValue({
 			data: [

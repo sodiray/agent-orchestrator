@@ -13,6 +13,7 @@ import {
 	toSessionActivity,
 	toSessionStatus,
 	type WorkspaceSummary,
+	type RemoteHostState,
 } from "../types/workspace";
 
 function toPullRequestFacts(pr: components["schemas"]["SessionPRFacts"]): PullRequestFacts {
@@ -62,6 +63,15 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 		await Promise.all([apiClient.GET("/api/v1/projects"), apiClient.GET("/api/v1/sessions")]);
 
 	if (projectsError || sessionsError) throw projectsError ?? sessionsError;
+	const sessions = sessionsData?.sessions ?? [];
+	const remoteHostIds = new Set(sessions.flatMap((session) => (session.hostId ? [session.hostId] : [])));
+	const remoteHosts =
+		remoteHostIds.size > 0
+			? await apiClient.GET("/api/v1/remote-hosts")
+			: { data: undefined, error: undefined };
+	const hostsById = new Map(
+		(remoteHosts.data?.remoteHosts ?? []).map((host) => [host.hostId, host] as const),
+	);
 
 	return (projectsData?.projects ?? []).map((project) => {
 		const kind = toProjectKind(project.kind);
@@ -71,9 +81,10 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 			kind,
 			path: project.path,
 			orchestratorAgent: project.orchestratorAgent ? toAgentProvider(project.orchestratorAgent) : undefined,
-			sessions: (sessionsData?.sessions ?? [])
+			sessions: sessions
 				.filter((session) => session.projectId === project.id)
 				.map((session) => {
+					const host = session.hostId ? hostsById.get(session.hostId) : undefined;
 					const status = toSessionStatus(session.status, session.isTerminated);
 					const scmStatus = session.scmStatus ? toSessionStatus(session.scmStatus) : undefined;
 					const activity = toSessionActivity(session.activity);
@@ -84,6 +95,11 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 					return {
 						id: session.id,
 						terminalHandleId: session.terminalHandleId,
+						hostId: session.hostId,
+						hostLabel: host?.label?.trim() || session.hostId,
+						hostState: toRemoteHostState(host?.state),
+						availability: session.availability,
+						unavailableReason: session.unavailableReason,
 						workspaceId: project.id,
 						workspaceName: project.name,
 						title: session.displayName ?? session.issueId ?? session.id,
@@ -112,6 +128,13 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 				}),
 		};
 	});
+}
+
+function toRemoteHostState(state?: string): RemoteHostState | undefined {
+	if (state === "available" || state === "unreachable" || state === "stopped" || state === "destroyed") {
+		return state;
+	}
+	return undefined;
 }
 
 // Shared so route loaders can prefetch via queryClient.ensureQueryData (paired
