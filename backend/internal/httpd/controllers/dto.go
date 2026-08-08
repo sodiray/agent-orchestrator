@@ -12,6 +12,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	agentsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/agent"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	remotehostsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/remotehost"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
 
@@ -28,6 +29,26 @@ import (
 // as the path parameter.
 type ProjectIDParam struct {
 	ID string `path:"id" description:"Project identifier (registry key)."`
+}
+
+type RemoteHostIDParam struct {
+	HostID string `path:"hostId" description:"Operator-supplied remote host identifier."`
+}
+
+type ListRemoteHostsResponse struct {
+	RemoteHosts []remotehostsvc.Host `json:"remoteHosts"`
+}
+
+type RemoteHostResponse struct {
+	RemoteHost remotehostsvc.Host `json:"remoteHost"`
+}
+
+type UpdateRemoteHostStateRequest struct {
+	State string `json:"state" enum:"available,stopped,destroyed"`
+}
+
+type DeregisterRemoteHostResponse struct {
+	HostID string `json:"hostId"`
 }
 
 // AgentIDParam is the {agent} path parameter for one-agent catalog probes.

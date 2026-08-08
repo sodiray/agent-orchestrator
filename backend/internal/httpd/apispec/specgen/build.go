@@ -18,6 +18,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	remotehostsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/remotehost"
 )
 
 // Build reflects the Go contract types and the operation registry below into
@@ -59,6 +60,8 @@ func Build() ([]byte, error) {
 			"Supported and locally runnable agent adapters"),
 		*(&openapi31.Tag{Name: "projects"}).WithDescription(
 			"Project registry, configuration, and lifecycle administration"),
+		*(&openapi31.Tag{Name: "remoteHosts"}).WithDescription(
+			"Remote daemon registration and connection health"),
 		*(&openapi31.Tag{Name: "sessions"}).WithDescription(
 			"Agent session lifecycle and messaging"),
 		*(&openapi31.Tag{Name: "prs"}).WithDescription(
@@ -195,6 +198,11 @@ var schemaNames = map[string]string{
 	"ControllersAgentIDParam":                             "AgentIDParam",
 	"ControllersGetProjectResponse":                       "ProjectGetResponse",
 	"ControllersProjectOrDegraded":                        "ProjectOrDegraded",
+	"ControllersRemoteHostIDParam":                        "RemoteHostIDParam",
+	"ControllersListRemoteHostsResponse":                  "ListRemoteHostsResponse",
+	"ControllersRemoteHostResponse":                       "RemoteHostResponse",
+	"ControllersUpdateRemoteHostStateRequest":             "UpdateRemoteHostStateRequest",
+	"ControllersDeregisterRemoteHostResponse":             "DeregisterRemoteHostResponse",
 	"ControllersListSessionsQuery":                        "ListSessionsQuery",
 	"ControllersCleanupSessionsQuery":                     "CleanupSessionsQuery",
 	"ControllersListSessionsResponse":                     "ListSessionsResponse",
@@ -331,6 +339,8 @@ var schemaNames = map[string]string{
 	"ProjectSetConfigInput":             "SetProjectConfigInput",
 	"ProjectUpdateSettingsInput":        "UpdateProjectSettingsInput",
 	"ProjectWorkspaceRepo":              "WorkspaceRepo",
+	"RemotehostRegisterInput":           "RegisterRemoteHostInput",
+	"RemotehostHost":                    "RemoteHost",
 	"SessionWorkspaceFileStatus":        "WorkspaceFileStatus",
 }
 
@@ -411,6 +421,7 @@ func operations() []operation {
 	ops := append([]operation{}, eventOperations()...)
 	ops = append(ops, agentOperations()...)
 	ops = append(ops, projectOperations()...)
+	ops = append(ops, remoteHostOperations()...)
 	ops = append(ops, sessionOperations()...)
 	ops = append(ops, prOperations()...)
 	ops = append(ops, reviewOperations()...)
@@ -1172,6 +1183,70 @@ func projectOperations() []operation {
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+	}
+}
+
+func remoteHostOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/remote-hosts", id: "listRemoteHosts", tag: "remoteHosts",
+			summary: "List registered remote daemon hosts and their connection health",
+			resps: []respUnit{
+				{http.StatusOK, controllers.ListRemoteHostsResponse{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/remote-hosts", id: "registerRemoteHost", tag: "remoteHosts",
+			summary: "Register a reachable remote daemon host",
+			reqBody: remotehostsvc.RegisterInput{},
+			resps: []respUnit{
+				{http.StatusCreated, controllers.RemoteHostResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodGet, path: "/api/v1/remote-hosts/{hostId}", id: "getRemoteHost", tag: "remoteHosts",
+			summary:    "Get one registered remote daemon host",
+			pathParams: []any{controllers.RemoteHostIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.RemoteHostResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPatch, path: "/api/v1/remote-hosts/{hostId}/state", id: "updateRemoteHostState", tag: "remoteHosts",
+			summary:    "Declare a remote host stopped or destroyed, or resume health probing",
+			pathParams: []any{controllers.RemoteHostIDParam{}},
+			reqBody:    controllers.UpdateRemoteHostStateRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.RemoteHostResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodDelete, path: "/api/v1/remote-hosts/{hostId}", id: "deregisterRemoteHost", tag: "remoteHosts",
+			summary:    "Deregister a remote daemon host",
+			pathParams: []any{controllers.RemoteHostIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.DeregisterRemoteHostResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
 			},
 		},
 	}

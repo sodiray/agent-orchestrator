@@ -1310,6 +1310,219 @@ paths:
       summary: Unregister a phone's Expo push token
       tags:
       - push
+  /api/v1/remote-hosts:
+    get:
+      operationId: listRemoteHosts
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListRemoteHostsResponse'
+          description: OK
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: List registered remote daemon hosts and their connection health
+      tags:
+      - remoteHosts
+    post:
+      operationId: registerRemoteHost
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRemoteHostInput'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteHostResponse'
+          description: Created
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Register a reachable remote daemon host
+      tags:
+      - remoteHosts
+  /api/v1/remote-hosts/{hostId}:
+    delete:
+      operationId: deregisterRemoteHost
+      parameters:
+      - description: Operator-supplied remote host identifier.
+        in: path
+        name: hostId
+        required: true
+        schema:
+          description: Operator-supplied remote host identifier.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeregisterRemoteHostResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Deregister a remote daemon host
+      tags:
+      - remoteHosts
+    get:
+      operationId: getRemoteHost
+      parameters:
+      - description: Operator-supplied remote host identifier.
+        in: path
+        name: hostId
+        required: true
+        schema:
+          description: Operator-supplied remote host identifier.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteHostResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Get one registered remote daemon host
+      tags:
+      - remoteHosts
+  /api/v1/remote-hosts/{hostId}/state:
+    patch:
+      operationId: updateRemoteHostState
+      parameters:
+      - description: Operator-supplied remote host identifier.
+        in: path
+        name: hostId
+        required: true
+        schema:
+          description: Operator-supplied remote host identifier.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRemoteHostStateRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoteHostResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Declare a remote host stopped or destroyed, or resume health probing
+      tags:
+      - remoteHosts
   /api/v1/reviews/{reviewSessionID}/activity:
     post:
       operationId: setReviewActivity
@@ -5261,6 +5474,13 @@ components:
       - ok
       - workerId
       type: object
+    DeregisterRemoteHostResponse:
+      properties:
+        hostId:
+          type: string
+      required:
+      - hostId
+      type: object
     DevImportProjectsConflict:
       properties:
         path:
@@ -5478,6 +5698,15 @@ components:
           type: array
       required:
       - projects
+      type: object
+    ListRemoteHostsResponse:
+      properties:
+        remoteHosts:
+          items:
+            $ref: '#/components/schemas/RemoteHost'
+          type: array
+      required:
+      - remoteHosts
       type: object
     ListReviewsResponse:
       properties:
@@ -5974,6 +6203,18 @@ components:
       required:
       - token
       type: object
+    RegisterRemoteHostInput:
+      properties:
+        address:
+          type: string
+        hostId:
+          type: string
+        label:
+          type: string
+      required:
+      - hostId
+      - address
+      type: object
     ReloadConversationMCPServersResponse:
       properties:
         servers:
@@ -5982,6 +6223,45 @@ components:
           type: array
       required:
       - servers
+      type: object
+    RemoteHost:
+      properties:
+        address:
+          type: string
+        createdAt:
+          format: date-time
+          type: string
+        hostId:
+          type: string
+        label:
+          type: string
+        lastProbeAt:
+          format: date-time
+          type: string
+        lastProbeError:
+          type: string
+        lastProbeSucceeded:
+          type: boolean
+        state:
+          type: string
+        updatedAt:
+          format: date-time
+          type: string
+      required:
+      - hostId
+      - address
+      - state
+      - lastProbeAt
+      - lastProbeSucceeded
+      - createdAt
+      - updatedAt
+      type: object
+    RemoteHostResponse:
+      properties:
+        remoteHost:
+          $ref: '#/components/schemas/RemoteHost'
+      required:
+      - remoteHost
       type: object
     RemoveProjectResult:
       properties:
@@ -7147,6 +7427,17 @@ components:
       - displayName
       - config
       type: object
+    UpdateRemoteHostStateRequest:
+      properties:
+        state:
+          enum:
+          - available
+          - stopped
+          - destroyed
+          type: string
+      required:
+      - state
+      type: object
     UpdateSessionInterfaceRequest:
       properties:
         defaultSessionMode:
@@ -7349,6 +7640,8 @@ tags:
   name: agents
 - description: Project registry, configuration, and lifecycle administration
   name: projects
+- description: Remote daemon registration and connection health
+  name: remoteHosts
 - description: Agent session lifecycle and messaging
   name: sessions
 - description: Pull-request actions (SCM lane)

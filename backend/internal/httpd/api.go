@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	remotehostsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/remotehost"
 	reviewsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/review"
 )
 
@@ -21,6 +22,7 @@ import (
 type APIDeps struct {
 	Agents             controllers.AgentCatalog
 	Projects           projectsvc.Manager
+	RemoteHosts        remotehostsvc.Manager
 	Sessions           controllers.SessionService
 	Activity           controllers.ActivityRecorder
 	UsageHooks         controllers.UsageHookRecorder
@@ -53,6 +55,7 @@ type API struct {
 	cfg           config.Config
 	agents        *controllers.AgentsController
 	projects      *controllers.ProjectsController
+	remoteHosts   *controllers.RemoteHostsController
 	sessions      *controllers.SessionsController
 	usage         *controllers.UsageController
 	prs           *controllers.PRsController
@@ -80,6 +83,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		projects: &controllers.ProjectsController{
 			Mgr: deps.Projects,
 		},
+		remoteHosts: &controllers.RemoteHostsController{Mgr: deps.RemoteHosts},
 		sessions: &controllers.SessionsController{
 			Svc:           deps.Sessions,
 			Activity:      deps.Activity,
@@ -118,6 +122,7 @@ func (a *API) Register(root chi.Router) {
 			r.Use(middleware.Timeout(timeout))
 			a.agents.Register(r)
 			a.projects.Register(r)
+			a.remoteHosts.Register(r)
 			a.sessions.Register(r)
 			a.usage.Register(r)
 			a.prs.Register(r)
