@@ -105,10 +105,8 @@ const (
 	EnvBrowserRuntimeToken = "AO_BROWSER_RUNTIME_TOKEN" //nolint:gosec // Environment variable name, not a credential.
 )
 
-// hookBinaryName is the executable name the workspace hook commands invoke:
-// every agent adapter installs a bare `ao hooks <agent> <event>`. The session
-// PATH pin (hookPATH) only works when the daemon's own executable carries this
-// name, since prepending its directory must change what `ao` resolves to.
+// hookBinaryName is retained for the temporary PATH compatibility pin used by
+// settings files written before hooks began recording an absolute executable.
 const hookBinaryName = "ao"
 
 type lifecycleRecorder interface {
@@ -257,12 +255,14 @@ type Manager struct {
 	// executable resolves the daemon's own binary (os.Executable in
 	// production); its directory is prepended to spawned sessions' PATH so the
 	// workspace hook commands resolve back to this daemon. Tests inject a stub.
-	executable   func() (string, error)
-	newLaunchID  func() string
-	resumeMu     sync.Mutex
-	resuming     map[domain.SessionID]struct{}
-	transitionMu sync.Mutex
-	transitions  map[domain.SessionID]*interfaceTransitionRun
+	executable       func() (string, error)
+	newLaunchID      func() string
+	resumeMu         sync.Mutex
+	resuming         map[domain.SessionID]struct{}
+	projectRootMu    sync.Mutex
+	projectRootLocks map[domain.ProjectID]*sync.Mutex
+	transitionMu     sync.Mutex
+	transitions      map[domain.SessionID]*interfaceTransitionRun
 	// transitionDeliveryWake drives the durable transition-message outbox. A
 	// daemon-lifetime worker is started by Reconcile; terminal transition paths
 	// also make one immediate delivery attempt so tests and in-process callers do
@@ -481,6 +481,7 @@ func New(d Deps) *Manager {
 		executable:             d.Executable,
 		newLaunchID:            d.NewLaunchID,
 		resuming:               make(map[domain.SessionID]struct{}),
+		projectRootLocks:       make(map[domain.ProjectID]*sync.Mutex),
 		transitions:            make(map[domain.SessionID]*interfaceTransitionRun),
 		transitionDeliveryWake: make(chan struct{}, 1),
 		sendConfirm: sendConfirmConfig{
@@ -524,6 +525,24 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 	}
 	projectKind := project.Kind.WithDefault()
+	workspaceMode := domain.NormalizeWorkspaceMode(cfg.WorkspaceMode)
+	if workspaceMode == domain.WorkspaceModeProjectRoot {
+		if projectKind == domain.ProjectKindScratch {
+			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: project-root workspace mode is not supported for Scratch projects")
+		}
+		if strings.TrimSpace(cfg.Branch) != "" {
+			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: --branch cannot be used with project-root workspace mode")
+		}
+		unlock := m.lockProjectRoot(cfg.ProjectID)
+		defer unlock()
+		if err := m.ensureProjectRootAvailable(ctx, cfg.ProjectID); err != nil {
+			return domain.SessionRecord{}, 0, 0, err
+		}
+	}
+	cfg.WorkspaceMode = workspaceMode
+	if workspaceMode == domain.WorkspaceModeProjectRoot {
+		cfg.Branch = domain.ProjectRootWorkspaceBranch
+	}
 	if projectKind == domain.ProjectKindScratch && strings.TrimSpace(cfg.Branch) != "" {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", ErrScratchBranchUnsupported)
 	}
@@ -584,7 +603,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 
 	branch := cfg.Branch
-	if branch == "" {
+	if workspaceMode == domain.WorkspaceModeIsolated && branch == "" {
 		branch = DefaultSpawnBranch(id, cfg.Kind, sessionPrefix(project), projectKind, m.dataDir)
 	}
 	ws, workspaceProject, err := m.createSessionWorkspace(ctx, project, cfg, id, branch)
@@ -762,6 +781,9 @@ func (m *Manager) loadProject(ctx context.Context, projectID domain.ProjectID) (
 }
 
 func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.ProjectRecord, cfg ports.SpawnConfig, id domain.SessionID, branch string) (ports.WorkspaceInfo, *ports.WorkspaceProjectInfo, error) {
+	if domain.NormalizeWorkspaceMode(cfg.WorkspaceMode) == domain.WorkspaceModeProjectRoot {
+		return ports.WorkspaceInfo{Path: project.Path, Branch: branch, RepoPath: project.Path, SessionID: id, ProjectID: cfg.ProjectID}, nil, nil
+	}
 	projectKind := project.Kind.WithDefault()
 	if projectKind != domain.ProjectKindWorkspace {
 		baseBranch := project.Config.WithDefaults().DefaultBranch
@@ -885,6 +907,9 @@ func (m *Manager) destroySpawnWorkspace(ctx context.Context, ws ports.WorkspaceI
 }
 
 func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo, runtimeDestroyed bool) bool {
+	if isProjectRootSession(rec) {
+		return true
+	}
 	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
 		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
 		return true
@@ -894,6 +919,10 @@ func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain
 }
 
 func (m *Manager) rollbackSeedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo, prepared bool) {
+	if isProjectRootSession(rec) {
+		m.rollbackSpawnSeedRow(ctx, rec.ID)
+		return
+	}
 	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
 		if prepared {
 			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
@@ -1094,6 +1123,7 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	m.destroyBrowserBestEffort(ctx, id)
 	handle := runtimeHandle(rec.Metadata)
 	ws := workspaceInfo(rec)
+	projectRoot := isProjectRootSession(rec)
 
 	var workspaceProjectRows []ports.WorkspaceRepoInfo
 	workspaceProject := false
@@ -1125,7 +1155,7 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	// one in the same race window. A runtime that cannot be confirmed dead
 	// stops Kill here — same shape as a dirty-workspace refusal — rather than
 	// letting the worktree disappear out from under it.
-	if ws.Path != "" {
+	if ws.Path != "" && !projectRoot {
 		release, err := m.beginShellTerminalTeardown(ctx, id)
 		if err != nil {
 			// Same shape as the dirty-workspace refusal below: the worktree is
@@ -1146,7 +1176,9 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 		}
 	}
 	freed := false
-	if workspaceProject {
+	if projectRoot {
+		freed = false
+	} else if workspaceProject {
 		cleaned, err := m.destroyWorkspaceProjectRows(ctx, workspaceProjectRows)
 		if err != nil {
 			if errors.Is(err, ports.ErrWorkspaceDirty) {
@@ -1210,6 +1242,18 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 	}
 	m.stopPreviewBestEffort(ctx, id)
 	m.destroyBrowserBestEffort(ctx, id)
+	if isProjectRootSession(rec) {
+		handle := runtimeHandle(rec.Metadata)
+		if handle.ID != "" {
+			if err := m.runtime.Destroy(ctx, handle); err != nil {
+				return fmt.Errorf("retire replacement %s: runtime: %w", id, err)
+			}
+		}
+		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
+			return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
+		}
+		return m.lcm.MarkTerminated(ctx, id)
+	}
 	if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
 		if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 			return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
@@ -1360,7 +1404,7 @@ func (m *Manager) RestoreWithMode(ctx context.Context, id domain.SessionID) (Res
 	// the workspace landed has neither WorkspacePath nor Branch, and there is
 	// nothing meaningful to restore from. Surface this as a typed 409 instead of
 	// letting workspace.Restore fail with an opaque wrapped error.
-	if meta.WorkspacePath == "" || (meta.Branch == "" && project.Kind.WithDefault() != domain.ProjectKindScratch) {
+	if meta.WorkspacePath == "" || (meta.Branch == "" && project.Kind.WithDefault() != domain.ProjectKindScratch && !isProjectRootSession(rec)) {
 		return RestoreResult{}, fmt.Errorf("restore %s: %w", id, ErrIncompleteHandle)
 	}
 	// Resumability is decided inside restoreArgv, not here. A promptless session
@@ -1636,7 +1680,10 @@ func (m *Manager) SaveAndTeardownAll(ctx context.Context) error {
 		if rec.IsTerminated {
 			continue
 		}
-		if rec.Metadata.WorkspacePath == "" || rec.Metadata.Branch == "" {
+		if isProjectRootSession(rec) {
+			continue
+		}
+		if rec.Metadata.WorkspacePath == "" || (rec.Metadata.Branch == "" && !isProjectRootSession(rec)) {
 			continue
 		}
 		if err := m.saveAndTeardownOne(ctx, rec, true); err != nil {
@@ -1740,7 +1787,13 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 		return err
 	}
 	projectKind := project.Kind.WithDefault()
-	if rec.Metadata.WorkspacePath == "" || (rec.Metadata.Branch == "" && projectKind != domain.ProjectKindScratch) {
+	if isProjectRootSession(rec) {
+		if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
+			return m.lcm.MarkTerminated(ctx, rec.ID)
+		}
+		return nil
+	}
+	if rec.Metadata.WorkspacePath == "" || (rec.Metadata.Branch == "" && projectKind != domain.ProjectKindScratch && !isProjectRootSession(rec)) {
 		return nil
 	}
 	// A chat controller is an in-process child of the daemon, so unlike tmux it can
@@ -2022,6 +2075,9 @@ func (m *Manager) markSessionWorktreesActive(ctx context.Context, rows []domain.
 }
 
 func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) (ports.WorkspaceInfo, error) {
+	if isProjectRootSession(rec) {
+		return ports.WorkspaceInfo{Path: project.Path, RepoPath: project.Path, SessionID: rec.ID, ProjectID: rec.ProjectID}, nil
+	}
 	if project.Kind.WithDefault() != domain.ProjectKindWorkspace {
 		return m.workspace.Restore(ctx, ports.WorkspaceConfig{
 			ProjectID:     rec.ProjectID,
@@ -2542,6 +2598,11 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 		if !rec.IsTerminated {
 			continue
 		}
+		if isProjectRootSession(rec) {
+			m.cleanupSystemPromptDir(rec.ID)
+			result.Skipped = append(result.Skipped, CleanupSkip{SessionID: rec.ID, Reason: "project-root workspace is owned by the operator"})
+			continue
+		}
 		ws := workspaceInfo(rec)
 		if ws.Path == "" {
 			m.cleanupSystemPromptDir(rec.ID)
@@ -2639,7 +2700,35 @@ func seedRecord(cfg ports.SpawnConfig, now time.Time) domain.SessionRecord {
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
 		Mode: domain.NormalizeSessionMode(cfg.RequestedMode),
+		Metadata: domain.SessionMetadata{
+			Branch: cfg.Branch,
+		},
 	}
+}
+
+func (m *Manager) lockProjectRoot(projectID domain.ProjectID) func() {
+	m.projectRootMu.Lock()
+	lock := m.projectRootLocks[projectID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.projectRootLocks[projectID] = lock
+	}
+	m.projectRootMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (m *Manager) ensureProjectRootAvailable(ctx context.Context, projectID domain.ProjectID) error {
+	recs, err := m.store.ListSessions(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("spawn: list project-root sessions: %w", err)
+	}
+	for _, rec := range recs {
+		if !rec.IsTerminated && isProjectRootSession(rec) {
+			return fmt.Errorf("spawn: project-root workspace is already in use by session %s", rec.ID)
+		}
+	}
+	return nil
 }
 
 func defaultSessionBranch(id domain.SessionID, kind domain.SessionKind, prefix, branchNamespace string) string {
@@ -3019,13 +3108,9 @@ func spawnEnv(id domain.SessionID, project domain.ProjectID, issue domain.IssueI
 	return env
 }
 
-// runtimeEnv is spawnEnv plus the hook PATH pin: the session's PATH puts the
-// running daemon's own directory first, so the bare `ao` in workspace hook
-// commands resolves to the daemon that installed them rather than whatever
-// `ao` is first on the inherited PATH (e.g. a legacy CLI without the hooks
-// command, which fails every callback and silently kills activity tracking).
-// When the pin cannot be applied the inherited PATH is kept and a warning is
-// logged so the degradation isn't silent.
+// runtimeEnv is spawnEnv plus a temporary PATH compatibility pin for settings
+// files written by older releases. Newly installed hooks record an absolute
+// daemon executable and do not depend on PATH.
 func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectID, issue domain.IssueID, projectEnv map[string]string) map[string]string {
 	env := spawnEnv(id, project, issue, m.dataDir, projectEnv)
 	if m.browserCapabilities != nil {
@@ -3034,7 +3119,7 @@ func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectID, issu
 	env[EnvBrowserRuntimeToken] = ""
 	path, err := HookPATH(m.executable, os.Getenv, projectEnv)
 	if err != nil {
-		m.logger.Warn("session PATH not pinned to the daemon binary; `ao hooks` callbacks may resolve to a different ao and activity tracking will stall",
+		m.logger.Warn("session PATH not pinned to the daemon binary; unrepaired legacy hook commands may resolve to a different ao",
 			"session", id, "error", err)
 		return env
 	}
@@ -3042,13 +3127,10 @@ func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectID, issu
 	return env
 }
 
-// HookPATH builds the PATH value pinned into a spawned session: the daemon
-// executable's directory prepended to the base PATH (the project's PATH
-// override when set, else the daemon's inherited PATH — matching what the
-// runtime would have exported anyway). An error means the pin cannot be
-// applied: the executable is unresolvable, or is not named "ao", in which case
-// prepending its directory would not change what `ao` resolves to. Exported so
-// the reviewer launcher can pin its pane's PATH the same way.
+// HookPATH builds the temporary PATH compatibility pin for legacy hook
+// commands: the daemon executable's directory is prepended to the base PATH.
+// It remains exported for the reviewer launcher while old settings files may
+// still be present.
 func HookPATH(executable func() (string, error), getenv func(string) string, projectEnv map[string]string) (string, error) {
 	exe, err := executable()
 	if err != nil {
@@ -3187,11 +3269,19 @@ func (m *Manager) augmentAgentRuntimeEnv(agent ports.Agent, env map[string]strin
 // startup hooks can update the already-created session row), then any optional
 // PreLaunch step. Shared by Spawn and Restore.
 func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspacePath, systemPrompt, systemPromptFile string, agentConfig ports.AgentConfig, env map[string]string) error {
+	executable, err := m.executable()
+	if err != nil {
+		return fmt.Errorf("resolve daemon executable for hooks: %w", err)
+	}
+	if !filepath.IsAbs(executable) {
+		return fmt.Errorf("daemon executable for hooks is not absolute: %s", executable)
+	}
 	if err := agent.GetAgentHooks(ctx, ports.WorkspaceHookConfig{
 		SessionID:        string(id),
 		WorkspacePath:    workspacePath,
 		DataDir:          m.dataDir,
 		Env:              env,
+		ExecutablePath:   executable,
 		SystemPrompt:     systemPrompt,
 		SystemPromptFile: systemPromptFile,
 		Config:           agentConfig,
@@ -3702,6 +3792,10 @@ func workspaceInfo(rec domain.SessionRecord) ports.WorkspaceInfo {
 		ProjectID: rec.ProjectID,
 		RepoPath:  rec.Metadata.WorkspaceRepoPath,
 	}
+}
+
+func isProjectRootSession(rec domain.SessionRecord) bool {
+	return domain.IsProjectRootWorkspaceBranch(rec.Metadata.Branch)
 }
 
 func workspaceInfoFromRepoInfo(info ports.WorkspaceRepoInfo) ports.WorkspaceInfo {

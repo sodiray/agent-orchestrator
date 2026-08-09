@@ -57,6 +57,9 @@ type Manager struct {
 	// CommandPrefix identifies AO-owned hook commands, e.g. "ao hooks goose ".
 	// Install skips commands already present and uninstall/detect match on it.
 	CommandPrefix string
+	// IsManagedCommand optionally recognizes older or dynamically rendered
+	// managed commands. When nil, CommandPrefix is the sole ownership marker.
+	IsManagedCommand func(command string) bool
 	// Timeout is written into each installed hook entry.
 	Timeout int
 	// Path returns the hooks file path for a workspace.
@@ -89,9 +92,10 @@ func (m Manager) Install(ctx context.Context, workspacePath string) error {
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
 		}
+		groups = removeManagedMatching(groups, m.isManagedCommand)
 		for _, spec := range specs {
 			entry := HookEntry{Type: "command", Command: spec.Command, Timeout: m.Timeout}
-			groups = reconcileHook(groups, entry, spec.Matcher)
+			groups = addHook(groups, entry, spec.Matcher)
 		}
 		if err := marshalEvent(rawHooks, event, groups); err != nil {
 			return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
@@ -131,7 +135,7 @@ func (m Manager) Uninstall(ctx context.Context, workspacePath string) error {
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}
-		groups = removeManaged(groups, m.CommandPrefix)
+		groups = removeManagedMatching(groups, m.isManagedCommand)
 		if err := marshalEvent(rawHooks, event, groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}
@@ -169,13 +173,20 @@ func (m Manager) AreInstalled(ctx context.Context, workspacePath string) (bool, 
 		}
 		for _, group := range groups {
 			for _, hook := range group.Hooks {
-				if strings.HasPrefix(hook.Command, m.CommandPrefix) {
+				if m.isManagedCommand(hook.Command) {
 					return true, nil
 				}
 			}
 		}
 	}
 	return false, nil
+}
+
+func (m Manager) isManagedCommand(command string) bool {
+	if m.IsManagedCommand != nil {
+		return m.IsManagedCommand(command)
+	}
+	return strings.HasPrefix(command, m.CommandPrefix)
 }
 
 // groupByEvent groups the managed specs by event so each event array is
@@ -317,11 +328,17 @@ func addHook(groups []MatcherGroup, hook HookEntry, matcher *string) []MatcherGr
 // group, dropping any group left without hooks so the event array doesn't
 // accumulate empty matcher objects.
 func removeManaged(groups []MatcherGroup, prefix string) []MatcherGroup {
+	return removeManagedMatching(groups, func(command string) bool {
+		return strings.HasPrefix(command, prefix)
+	})
+}
+
+func removeManagedMatching(groups []MatcherGroup, matches func(command string) bool) []MatcherGroup {
 	result := make([]MatcherGroup, 0, len(groups))
 	for _, group := range groups {
 		kept := make([]HookEntry, 0, len(group.Hooks))
 		for _, hook := range group.Hooks {
-			if !strings.HasPrefix(hook.Command, prefix) {
+			if !matches(hook.Command) {
 				kept = append(kept, hook)
 			}
 		}

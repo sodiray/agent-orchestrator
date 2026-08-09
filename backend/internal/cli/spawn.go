@@ -26,6 +26,7 @@ type spawnOptions struct {
 	kind           string
 	mode           string
 	branch         string
+	workspaceMode  string
 	prompt         string
 	issue          string
 	name           string
@@ -37,14 +38,15 @@ type spawnOptions struct {
 // spawnRequest mirrors the daemon's SpawnSessionRequest body for
 // POST /api/v1/sessions. The CLI keeps its own copy so it need not import httpd.
 type spawnRequest struct {
-	ProjectID   string `json:"projectId"`
-	IssueID     string `json:"issueId,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	Mode        string `json:"mode,omitempty"`
-	Harness     string `json:"harness,omitempty"`
-	Branch      string `json:"branch,omitempty"`
-	Prompt      string `json:"prompt,omitempty"`
-	DisplayName string `json:"displayName"`
+	ProjectID     string `json:"projectId"`
+	IssueID       string `json:"issueId,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	Harness       string `json:"harness,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+	WorkspaceMode string `json:"workspaceMode,omitempty"`
+	Prompt        string `json:"prompt,omitempty"`
+	DisplayName   string `json:"displayName"`
 }
 
 type spawnResult struct {
@@ -91,6 +93,12 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			if opts.kind != "" && opts.kind != "worker" && opts.kind != "orchestrator" {
 				return usageError{fmt.Errorf(`--kind must be "worker" or "orchestrator"`)}
 			}
+			if opts.workspaceMode != "" && opts.workspaceMode != "isolated" && opts.workspaceMode != "project-root" {
+				return usageError{fmt.Errorf(`--workspace-mode must be "isolated" or "project-root"`)}
+			}
+			if opts.workspaceMode == "project-root" && strings.TrimSpace(opts.branch) != "" {
+				return usageError{fmt.Errorf("--branch cannot be used with --workspace-mode project-root")}
+			}
 
 			project, err := ctx.resolveSpawnProject(cmd.Context(), opts.project)
 			if err != nil {
@@ -105,6 +113,9 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			opts.harness = harness
 
 			if isScratchProject(project) {
+				if opts.workspaceMode == "project-root" {
+					return usageError{fmt.Errorf("scratch projects do not support --workspace-mode project-root")}
+				}
 				if strings.TrimSpace(opts.branch) != "" {
 					return usageError{fmt.Errorf("scratch projects do not support --branch")}
 				}
@@ -126,14 +137,15 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				}
 			}
 			req := spawnRequest{
-				ProjectID:   opts.project,
-				IssueID:     opts.issue,
-				Kind:        opts.kind,
-				Harness:     opts.harness,
-				Mode:        opts.mode,
-				Branch:      opts.branch,
-				Prompt:      opts.prompt,
-				DisplayName: name,
+				ProjectID:     opts.project,
+				IssueID:       opts.issue,
+				Kind:          opts.kind,
+				Harness:       opts.harness,
+				Mode:          opts.mode,
+				Branch:        opts.branch,
+				WorkspaceMode: opts.workspaceMode,
+				Prompt:        opts.prompt,
+				DisplayName:   name,
 			}
 			var res spawnResult
 			if err := ctx.postJSON(cmd.Context(), "sessions", req, &res); err != nil {
@@ -178,7 +190,8 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.harness, "harness", "", "Agent harness / --agent: claude-code, codex, aider, opencode, grok, droid, amp, agy, crush, cursor, qwen, copilot, goose, auggie, continue, devin, cline, kimi, muse, kiro, kilocode, vibe, pi, autohand (default: project worker.agent; orchestrator spawns default to project orchestrator.agent; required if the project has none)")
 	f.StringVar(&opts.kind, "kind", "", "Session role: worker or orchestrator (default: worker)")
 	f.StringVar(&opts.mode, "mode", "", "Initial session interface: chat (structured agent connection) or tui (the agent's native terminal). Omitted uses the daemon default; compatible sessions can switch later.")
-	f.StringVar(&opts.branch, "branch", "", "Branch for git project sessions (default: ao/<session-id>/root; unsupported for Scratch)")
+	f.StringVar(&opts.branch, "branch", "", "Branch for isolated git project sessions (default: ao/<session-id>/root; incompatible with --workspace-mode project-root; unsupported for Scratch)")
+	f.StringVar(&opts.workspaceMode, "workspace-mode", "isolated", "Workspace location: isolated (git worktree) or project-root (the registered project directory; one active session per project)")
 	f.StringVar(&opts.prompt, "prompt", "", "Initial prompt for the agent")
 	f.StringVar(&opts.issue, "issue", "", "Issue id to associate with the session")
 	f.StringVar(&opts.name, "name", "", "Display name shown in the sidebar (required, max 20 characters)")

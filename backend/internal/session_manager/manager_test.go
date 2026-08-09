@@ -346,10 +346,16 @@ func (fakeAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return fakeAg
 type recordingAgent struct {
 	fakeAgent
 	lastConfig   ports.AgentConfig
+	lastHook     ports.WorkspaceHookConfig
 	lastLaunch   ports.LaunchConfig
 	lastRestore  ports.RestoreConfig
 	launchCalls  int
 	restoreCalls int
+}
+
+func (a *recordingAgent) GetAgentHooks(_ context.Context, cfg ports.WorkspaceHookConfig) error {
+	a.lastHook = cfg
+	return nil
 }
 
 func (a *recordingAgent) GetLaunchCommand(_ context.Context, cfg ports.LaunchConfig) ([]string, error) {
@@ -896,6 +902,28 @@ func TestSpawn_ResolvesProjectConfig(t *testing.T) {
 	}
 	if !agent.lastConfig.IsZero() {
 		t.Fatalf("launch config = %#v, want zero for project without config", agent.lastConfig)
+	}
+}
+
+func TestSpawn_ForwardsAbsoluteDaemonExecutableToHooks(t *testing.T) {
+	st := newFakeStore()
+	agent := &recordingAgent{}
+	m := New(Deps{
+		Runtime:    &fakeRuntime{},
+		Agents:     singleAgent{agent: agent},
+		Workspace:  &fakeWorkspace{},
+		Store:      st,
+		Messenger:  &fakeMessenger{},
+		Lifecycle:  &fakeLCM{store: st},
+		LookPath:   func(string) (string, error) { return "/bin/true", nil },
+		Executable: func() (string, error) { return "/opt/AO Tools/ao", nil },
+	})
+
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode}); err != nil {
+		t.Fatal(err)
+	}
+	if got := agent.lastHook.ExecutablePath; got != "/opt/AO Tools/ao" {
+		t.Fatalf("hook executable = %q, want daemon executable", got)
 	}
 }
 
@@ -2453,6 +2481,145 @@ func TestCleanup_ReclaimsTerminalWorkspaces(t *testing.T) {
 	}
 	if ws.destroyed != 1 {
 		t.Fatal("live workspace must not be destroyed")
+	}
+}
+
+func TestSpawn_ProjectRootUsesProjectDirectoryWithoutWorkspaceCreation(t *testing.T) {
+	m, st, rt, ws := newManager()
+	projectRoot := t.TempDir()
+	project := st.projects["mer"]
+	project.Path = projectRoot
+	st.projects["mer"] = project
+
+	rec, _, _, err := m.Spawn(ctx, ports.SpawnConfig{
+		ProjectID:     "mer",
+		Harness:       domain.HarnessClaudeCode,
+		WorkspaceMode: domain.WorkspaceModeProjectRoot,
+		Prompt:        "work here",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.lastCfg.ProjectID != "" {
+		t.Fatalf("workspace.Create config = %+v, want no workspace creation", ws.lastCfg)
+	}
+	if rec.Metadata.WorkspacePath != projectRoot {
+		t.Fatalf("workspace path = %q, want project root %q", rec.Metadata.WorkspacePath, projectRoot)
+	}
+	if rec.Metadata.Branch != domain.ProjectRootWorkspaceBranch {
+		t.Fatalf("workspace marker = %q, want %q", rec.Metadata.Branch, domain.ProjectRootWorkspaceBranch)
+	}
+	if rt.created != 1 || rt.lastCfg.WorkspacePath != projectRoot || rec.Metadata.RuntimeHandleID != "h1" {
+		t.Fatalf("runtime = created %d in %q with handle %q, want one terminal runtime in project root with attachable handle", rt.created, rt.lastCfg.WorkspacePath, rec.Metadata.RuntimeHandleID)
+	}
+}
+
+func TestSpawn_DefaultWorkspaceModeRemainsIsolated(t *testing.T) {
+	m, _, _, ws := newManager()
+	rec, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Harness: domain.HarnessClaudeCode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.lastCfg.ProjectID != "mer" {
+		t.Fatalf("workspace.Create project = %q, want mer", ws.lastCfg.ProjectID)
+	}
+	if rec.Metadata.Branch == "" || rec.Metadata.Branch == domain.ProjectRootWorkspaceBranch {
+		t.Fatalf("branch = %q, want generated isolated branch", rec.Metadata.Branch)
+	}
+}
+
+func TestSpawn_ProjectRootRejectsBranchAndConcurrentSession(t *testing.T) {
+	m, st, _, _ := newManager()
+	project := st.projects["mer"]
+	project.Path = t.TempDir()
+	st.projects["mer"] = project
+
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Harness: domain.HarnessClaudeCode, WorkspaceMode: domain.WorkspaceModeProjectRoot, Branch: "feature"}); err == nil || !strings.Contains(err.Error(), "--branch") {
+		t.Fatalf("branch conflict error = %v", err)
+	}
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Harness: domain.HarnessClaudeCode, WorkspaceMode: domain.WorkspaceModeProjectRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Harness: domain.HarnessClaudeCode, WorkspaceMode: domain.WorkspaceModeProjectRoot}); err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("concurrent project-root error = %v", err)
+	}
+}
+
+func TestRestore_ProjectRootKeepsProjectDirectory(t *testing.T) {
+	m, st, rt, ws := newManager()
+	projectRoot := t.TempDir()
+	project := st.projects["mer"]
+	project.Path = projectRoot
+	st.projects["mer"] = project
+
+	rec, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Harness: domain.HarnessClaudeCode, WorkspaceMode: domain.WorkspaceModeProjectRoot, Prompt: "work here"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Kill(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RestoreWithMode(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ws.lastCfg.ProjectID != "" {
+		t.Fatalf("workspace adapter config = %+v, want restore to keep project directory", ws.lastCfg)
+	}
+	if rt.created != 2 || rt.lastCfg.WorkspacePath != projectRoot {
+		t.Fatalf("runtime = created %d in %q, want restored terminal runtime in project root", rt.created, rt.lastCfg.WorkspacePath)
+	}
+}
+
+func TestSpawn_ProjectRootRejectsScratch(t *testing.T) {
+	m, st, _, _ := newManager()
+	st.projects["scratch"] = domain.ProjectRecord{ID: "scratch", Kind: domain.ProjectKindScratch, Config: testRoleAgents()}
+
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "scratch", Harness: domain.HarnessClaudeCode, WorkspaceMode: domain.WorkspaceModeProjectRoot}); err == nil || !strings.Contains(err.Error(), "not supported for Scratch") {
+		t.Fatalf("scratch project-root error = %v", err)
+	}
+}
+
+func TestCleanup_ProjectRootNeverDestroysProjectDirectory(t *testing.T) {
+	m, st, _, ws := newManager()
+	projectRoot := t.TempDir()
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID:           "mer-1",
+		ProjectID:    "mer",
+		IsTerminated: true,
+		Metadata: domain.SessionMetadata{
+			Branch:        domain.ProjectRootWorkspaceBranch,
+			WorkspacePath: projectRoot,
+		},
+	}
+
+	result, err := m.Cleanup(ctx, "mer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroy calls = %d, want 0", ws.destroyed)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Reason != "project-root workspace is owned by the operator" {
+		t.Fatalf("cleanup result = %+v", result)
+	}
+}
+
+func TestSpawn_ProjectRootFailureNeverDestroysProjectDirectory(t *testing.T) {
+	m, st, rt, ws := newManager()
+	projectRoot := t.TempDir()
+	project := st.projects["mer"]
+	project.Path = projectRoot
+	st.projects["mer"] = project
+	rt.createErr = errors.New("runtime unavailable")
+
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Harness: domain.HarnessClaudeCode, WorkspaceMode: domain.WorkspaceModeProjectRoot}); err == nil {
+		t.Fatal("expected runtime failure")
+	}
+	if ws.destroyed != 0 {
+		t.Fatalf("workspace destroy calls = %d, want 0", ws.destroyed)
+	}
+	if _, err := os.Stat(projectRoot); err != nil {
+		t.Fatalf("project root was removed: %v", err)
 	}
 }
 
@@ -4243,12 +4410,9 @@ func pathPinManager(executable func() (string, error)) (*Manager, *fakeStore, *f
 	return m, st, rt, logBuf
 }
 
-// TestSpawnAndRestore_PinHookPATHToDaemonBinary covers the activity-tracking
-// fix: the spawned session's PATH must put the daemon executable's directory
-// first, so the bare `ao` in the workspace hook commands resolves to the
-// daemon that installed them, not a foreign `ao` earlier on the user's PATH
-// (e.g. the legacy TypeScript CLI, which has no `hooks` command and silently
-// kills activity tracking).
+// TestSpawnAndRestore_PinHookPATHToDaemonBinary preserves PATH pinning for
+// sessions with legacy bare hook commands until their next spawn or restore
+// reconciles the workspace settings to use an absolute executable path.
 func TestSpawnAndRestore_PinHookPATHToDaemonBinary(t *testing.T) {
 	daemonExe := filepath.Join(t.TempDir(), "ao")
 	want := filepath.Dir(daemonExe) + string(os.PathListSeparator) + "/usr/bin"
@@ -4288,30 +4452,28 @@ func TestSpawnAndRestore_PinHookPATHToDaemonBinary(t *testing.T) {
 	}
 }
 
-// TestSpawn_HookPATHPinUnavailable asserts the degraded path is loud, not
-// silent: when the daemon executable cannot anchor `ao` resolution, PATH is
-// left to the runtime's inherited default and a warning is logged.
+// TestSpawn_HookExecutableRequired refuses a spawn when the daemon cannot
+// resolve the absolute executable path that its hooks must invoke.
 func TestSpawn_HookPATHPinUnavailable(t *testing.T) {
-	cases := []struct {
-		name       string
-		executable func() (string, error)
-	}{
-		{"executable unresolvable", func() (string, error) { return "", errors.New("no exe") }},
-		{"executable not named ao", func() (string, error) { return "/opt/aod/ao-daemon", nil }},
+	m, _, _, _ := pathPinManager(func() (string, error) { return "", errors.New("no exe") })
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker}); err == nil || !strings.Contains(err.Error(), "resolve daemon executable for hooks") {
+		t.Fatalf("Spawn err = %v, want hook executable resolution error", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			m, _, rt, logBuf := pathPinManager(tc.executable)
-			if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker}); err != nil {
-				t.Fatal(err)
-			}
-			if got, ok := rt.lastCfg.Env["PATH"]; ok {
-				t.Fatalf("runtime env PATH = %q, want unset when the pin cannot be applied", got)
-			}
-			if !strings.Contains(logBuf.String(), "not pinned") {
-				t.Fatalf("expected a 'not pinned' warning in the log, got %q", logBuf.String())
-			}
-		})
+}
+
+// TestSpawn_HookPATHPinUnavailableWhenDaemonNotNamedAO keeps the legacy PATH
+// compatibility path best-effort. New hooks use the absolute executable and
+// do not depend on this pin.
+func TestSpawn_HookPATHPinUnavailableWhenDaemonNotNamedAO(t *testing.T) {
+	m, _, rt, logBuf := pathPinManager(func() (string, error) { return "/opt/aod/ao-daemon", nil })
+	if _, _, _, err := m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := rt.lastCfg.Env["PATH"]; ok {
+		t.Fatalf("runtime env PATH = %q, want unset when the legacy pin cannot be applied", got)
+	}
+	if !strings.Contains(logBuf.String(), "not pinned") {
+		t.Fatalf("expected a 'not pinned' warning in the log, got %q", logBuf.String())
 	}
 }
 

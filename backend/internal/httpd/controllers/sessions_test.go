@@ -39,6 +39,7 @@ type fakeSessionService struct {
 	workspaceFiles   sessionsvc.WorkspaceFiles
 	workspaceFile    sessionsvc.WorkspaceFileDetail
 	workspacePaths   []string
+	spawnConfig      ports.SpawnConfig
 	spawnErr         error
 	orchestratorMode domain.SessionMode
 	claimErr         error
@@ -133,6 +134,7 @@ func (f *fakeSessionService) Spawn(_ context.Context, cfg ports.SpawnConfig) (do
 	if f.spawnErr != nil {
 		return domain.Session{}, 0, 0, f.spawnErr
 	}
+	f.spawnConfig = cfg
 	now := time.Now().UTC()
 	s := domain.Session{SessionRecord: domain.SessionRecord{ID: domain.SessionID(string(cfg.ProjectID) + "-2"), ProjectID: cfg.ProjectID, IssueID: cfg.IssueID, Kind: cfg.Kind, Harness: cfg.Harness, DisplayName: cfg.DisplayName, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}, CreatedAt: now, UpdatedAt: now}, Status: domain.StatusIdle}
 	f.sessions[s.ID] = s
@@ -686,6 +688,24 @@ func TestSessionsAPI_SpawnRejectsUnknownExplicitMode(t *testing.T) {
 	if len(svc.sessions) != 1 {
 		t.Fatalf("invalid mode created a session: %#v", svc.sessions)
 	}
+}
+
+func TestSessionsAPI_SpawnProjectRootMode(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions",
+		`{"projectId":"ao","kind":"worker","harness":"codex","workspaceMode":"project-root"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", status, body)
+	}
+	if svc.spawnConfig.WorkspaceMode != domain.WorkspaceModeProjectRoot {
+		t.Fatalf("workspace mode = %q, want project-root", svc.spawnConfig.WorkspaceMode)
+	}
+
+	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions",
+		`{"projectId":"ao","kind":"worker","harness":"codex","workspaceMode":"project-root","branch":"feature"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "WORKSPACE_MODE_BRANCH_CONFLICT")
 }
 
 func TestSessionsAPI_OrchestratorAcceptsExplicitChatMode(t *testing.T) {

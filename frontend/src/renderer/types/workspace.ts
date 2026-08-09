@@ -125,6 +125,14 @@ export type SessionMode = "chat" | "tui";
 
 export type RemoteHostState = "available" | "unreachable" | "stopped" | "destroyed";
 
+export type RemoteHostSummary = {
+	id: string;
+	label: string;
+	state: RemoteHostState;
+	reason?: string;
+	inventoryStale?: boolean;
+};
+
 export type WorkspaceSession = {
 	id: string;
 	terminalHandleId?: string;
@@ -313,6 +321,8 @@ export type WorkspaceSummary = {
 	type?: "main" | "worktree";
 	orchestratorAgent?: AgentProvider;
 	accentColor?: string;
+	/** Project fields that differ across merged local/remote project sources. */
+	metadataConflicts?: string[];
 	diff?: {
 		additions: number;
 		deletions: number;

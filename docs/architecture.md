@@ -217,7 +217,7 @@ backend/internal/
 │   ├── scm/             # GitHub
 │   └── tracker/         # GitHub tracker
 ├── daemon/              # Production wiring
-└── config/              # Environment-based configuration
+└── config/              # Defaults, protected config file, and environment overrides
 ```
 
 ### Core Data Flow

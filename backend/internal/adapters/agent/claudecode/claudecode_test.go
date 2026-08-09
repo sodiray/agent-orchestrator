@@ -221,18 +221,19 @@ func TestClaudeSessionUUIDDeterministicAndUnique(t *testing.T) {
 func TestGetAgentHooksInstallsClaudeHooks(t *testing.T) {
 	p := &Plugin{resolvedBinary: "claude"}
 	workspace := t.TempDir()
+	executablePath := "/opt/AO Tools/ao"
 	settingsDir := filepath.Join(workspace, ".claude")
 	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	settingsPath := filepath.Join(settingsDir, "settings.local.json")
-	// Pre-seed a user's own Stop hook + an unrelated setting; both must survive.
-	existing := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my own stop hook","timeout":5}]}]},"permissions":{"defaultMode":"plan"}}`
+	// Pre-seed user and foreign-tool hooks plus an unrelated setting; all must survive.
+	existing := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my own stop hook","timeout":5},{"type":"command","command":"other-tool stop","timeout":5}]}]},"permissions":{"defaultMode":"plan"}}`
 	if err := os.WriteFile(settingsPath, []byte(existing), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := ports.WorkspaceHookConfig{DataDir: t.TempDir(), SessionID: "sess-1", WorkspacePath: workspace}
+	cfg := ports.WorkspaceHookConfig{DataDir: t.TempDir(), ExecutablePath: executablePath, SessionID: "sess-1", WorkspacePath: workspace}
 	if err := p.GetAgentHooks(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +258,7 @@ func TestGetAgentHooksInstallsClaudeHooks(t *testing.T) {
 	}
 
 	// Every managed command is installed exactly once under its event.
-	for _, spec := range claudeManagedHooks {
+	for _, spec := range claudeManagedHooks(executablePath) {
 		if got := countClaudeHookCommand(config.Hooks[spec.Event], spec.Command); got != 1 {
 			t.Fatalf("%s command %q count = %d, want 1", spec.Event, spec.Command, got)
 		}
@@ -266,23 +267,26 @@ func TestGetAgentHooksInstallsClaudeHooks(t *testing.T) {
 	if countClaudeHookCommand(config.Hooks["Stop"], "my own stop hook") != 1 {
 		t.Fatalf("existing Stop hook not preserved: %#v", config.Hooks["Stop"])
 	}
+	if countClaudeHookCommand(config.Hooks["Stop"], "other-tool stop") != 1 {
+		t.Fatalf("foreign Stop hook not preserved: %#v", config.Hooks["Stop"])
+	}
 	// Unrelated settings preserved.
 	if len(config.Permissions) == 0 {
 		t.Fatalf("unrelated settings clobbered: %s", data)
 	}
 	// SessionStart carries the required matcher; UserPromptSubmit omits it.
-	if m := matcherForCommand(config.Hooks["SessionStart"], "ao hooks claude-code session-start"); m == nil || *m != "startup" {
+	if m := matcherForCommand(config.Hooks["SessionStart"], claudeHookCommandPrefix(executablePath)+"session-start"); m == nil || *m != "startup" {
 		t.Fatalf("SessionStart matcher = %v, want startup", m)
 	}
-	if m := matcherForCommand(config.Hooks["UserPromptSubmit"], "ao hooks claude-code user-prompt-submit"); m != nil {
+	if m := matcherForCommand(config.Hooks["UserPromptSubmit"], claudeHookCommandPrefix(executablePath)+"user-prompt-submit"); m != nil {
 		t.Fatalf("UserPromptSubmit matcher = %v, want none", m)
 	}
 	// Notification and SessionEnd install with no matcher (they fire for all
 	// sub-types; the handler filters on the payload).
-	if m := matcherForCommand(config.Hooks["Notification"], "ao hooks claude-code notification"); m != nil {
+	if m := matcherForCommand(config.Hooks["Notification"], claudeHookCommandPrefix(executablePath)+"notification"); m != nil {
 		t.Fatalf("Notification matcher = %v, want none", m)
 	}
-	if m := matcherForCommand(config.Hooks["SessionEnd"], "ao hooks claude-code session-end"); m != nil {
+	if m := matcherForCommand(config.Hooks["SessionEnd"], claudeHookCommandPrefix(executablePath)+"session-end"); m != nil {
 		t.Fatalf("SessionEnd matcher = %v, want none", m)
 	}
 }
@@ -291,9 +295,10 @@ func TestUninstallHooksRemovesClaudeHooks(t *testing.T) {
 	p := &Plugin{resolvedBinary: "claude"}
 	workspace := t.TempDir()
 	settingsPath := filepath.Join(workspace, ".claude", "settings.local.json")
+	executablePath := "/opt/ao"
 
 	ctx := context.Background()
-	cfg := ports.WorkspaceHookConfig{DataDir: t.TempDir(), SessionID: "sess-1", WorkspacePath: workspace}
+	cfg := ports.WorkspaceHookConfig{DataDir: t.TempDir(), ExecutablePath: executablePath, SessionID: "sess-1", WorkspacePath: workspace}
 
 	// Pre-seed a user's own Stop hook + an unrelated setting; both must survive.
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
@@ -331,7 +336,7 @@ func TestUninstallHooksRemovesClaudeHooks(t *testing.T) {
 	}
 	// No managed command survives; the SessionStart/UserPromptSubmit events,
 	// which held only AO hooks, are removed entirely.
-	for _, spec := range claudeManagedHooks {
+	for _, spec := range claudeManagedHooks(executablePath) {
 		if got := countClaudeHookCommand(config.Hooks[spec.Event], spec.Command); got != 0 {
 			t.Fatalf("%s command %q count = %d after uninstall, want 0", spec.Event, spec.Command, got)
 		}
@@ -347,6 +352,48 @@ func TestUninstallHooksRemovesClaudeHooks(t *testing.T) {
 	// Uninstall is idempotent: a second call is a clean no-op.
 	if err := p.UninstallHooks(ctx, workspace); err != nil {
 		t.Fatalf("second uninstall: %v", err)
+	}
+}
+
+func TestGetAgentHooksRepairsLegacyBareCommands(t *testing.T) {
+	p := &Plugin{resolvedBinary: "claude"}
+	workspace := t.TempDir()
+	settingsPath := filepath.Join(workspace, ".claude", "settings.local.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := claudeLegacyHookPrefix + "notification"
+	existing := `{"hooks":{"Notification":[{"hooks":[{"type":"command","command":"` + legacy + `"},{"type":"command","command":"foreign notification"}]}]}}`
+	if err := os.WriteFile(settingsPath, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	executablePath := "/Applications/AO Current/ao"
+	if err := p.GetAgentHooks(context.Background(), ports.WorkspaceHookConfig{
+		ExecutablePath: executablePath,
+		WorkspacePath:  workspace,
+	}); err != nil {
+		t.Fatalf("GetAgentHooks: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Hooks map[string][]hooksjson.MatcherGroup `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	if countClaudeHookCommand(config.Hooks["Notification"], legacy) != 0 {
+		t.Fatalf("legacy command was not replaced: %#v", config.Hooks["Notification"])
+	}
+	if countClaudeHookCommand(config.Hooks["Notification"], claudeHookCommandPrefix(executablePath)+"notification") != 1 {
+		t.Fatalf("absolute command missing: %#v", config.Hooks["Notification"])
+	}
+	if countClaudeHookCommand(config.Hooks["Notification"], "foreign notification") != 1 {
+		t.Fatalf("foreign hook was not preserved: %#v", config.Hooks["Notification"])
 	}
 }
 

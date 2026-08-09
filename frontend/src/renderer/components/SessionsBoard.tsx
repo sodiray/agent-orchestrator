@@ -336,6 +336,12 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 			) : null}
 
 			<div className="min-h-0 flex-1 overflow-hidden">
+				{workspace?.metadataConflicts?.length ? (
+					<div className="mx-3 my-3 flex items-center gap-3 rounded-md border border-warning/40 bg-surface px-3 py-2 text-xs text-muted-foreground" role="status">
+						<AlertTriangle className="size-icon-base shrink-0 text-warning" aria-hidden="true" />
+						<span>{t("remoteHost.projectMetadataConflict", { fields: workspace.metadataConflicts.join(", ") })}</span>
+					</div>
+				) : null}
 				{projectId && health.state !== "ok" ? (
 					<div className="mx-3 my-3 flex items-center gap-3 rounded-md border border-border bg-surface px-3 py-2 text-xs text-muted-foreground">
 						<AlertTriangle className="size-icon-base shrink-0 text-warning" aria-hidden="true" />

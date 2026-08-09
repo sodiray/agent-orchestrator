@@ -26,6 +26,25 @@ type RemoteDaemonSessionLister interface {
 	ListSessions(ctx context.Context, address string, filter RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error)
 }
 
+// RemoteProjectSummary is the owner-daemon project row used only at the
+// federation boundary. Project ids remain display grouping keys; they never
+// replace host-qualified session identity for a session operation.
+type RemoteProjectSummary struct {
+	ID                domain.ProjectID
+	Name              string
+	Path              string
+	Kind              domain.ProjectKind
+	SessionPrefix     string
+	OrchestratorAgent domain.AgentHarness
+	ResolveError      string
+}
+
+// RemoteDaemonProjectLister reads the native project list from one owning
+// daemon. The response must not itself be federated.
+type RemoteDaemonProjectLister interface {
+	ListProjects(ctx context.Context, address string) ([]RemoteProjectSummary, error)
+}
+
 // RemoteNotificationListPage is one owner-daemon notification page. Notification
 // IDs and session IDs are deliberately bare here; federation qualifies both at
 // the local daemon boundary.

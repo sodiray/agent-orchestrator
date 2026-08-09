@@ -33,6 +33,37 @@ ON CONFLICT (host_id) DO NOTHING`, host.HostID, host.Address, host.Label, host.O
 	return affected > 0, nil
 }
 
+func (s *Store) UpsertRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	result, err := s.writeDB.ExecContext(ctx, `
+INSERT INTO remote_hosts (
+    host_id, address, label, operator_state, last_probe_at, last_probe_succeeded,
+    last_probe_error, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (host_id) DO NOTHING`, host.HostID, host.Address, host.Label, host.OperatorState,
+		host.LastProbeAt, host.LastProbeSucceeded, host.LastProbeError, host.CreatedAt, host.UpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("insert remote host %s: %w", host.HostID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read insert remote host result %s: %w", host.HostID, err)
+	}
+	if affected > 0 {
+		return true, nil
+	}
+	if _, err := s.writeDB.ExecContext(ctx, `
+UPDATE remote_hosts
+SET address = ?, label = ?, operator_state = ?, last_probe_at = ?, last_probe_succeeded = ?,
+    last_probe_error = ?, updated_at = ?
+WHERE host_id = ?`, host.Address, host.Label, host.OperatorState, host.LastProbeAt,
+		host.LastProbeSucceeded, host.LastProbeError, host.UpdatedAt, host.HostID); err != nil {
+		return false, fmt.Errorf("update remote host %s: %w", host.HostID, err)
+	}
+	return false, nil
+}
+
 func (s *Store) ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error) {
 	rows, err := s.readDB.QueryContext(ctx, `
 SELECT host_id, address, label, operator_state, last_probe_at, last_probe_succeeded,

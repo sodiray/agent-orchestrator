@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonendpoint"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
 
@@ -70,21 +71,22 @@ func (c *commandContext) stopDaemon(ctx context.Context, opts stopOptions) (daem
 		return daemonStatus{}, fmt.Errorf("daemon pid %d is alive but ownership could not be verified", st.PID)
 	}
 
-	if err := c.requestShutdown(ctx, st.Port); err != nil {
+	if err := c.requestShutdown(ctx, st.Port, st.SocketPath); err != nil {
 		return daemonStatus{}, fmt.Errorf("request daemon shutdown: %w", err)
 	}
 	return c.waitForStopped(ctx, st.PID, cfg.RunFilePath, cfg.DataDir, opts.timeout)
 }
 
-func (c *commandContext) requestShutdown(ctx context.Context, port int) error {
+func (c *commandContext) requestShutdown(ctx context.Context, port int, socketPath string) error {
 	reqCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, fmt.Sprintf("http://%s:%d/shutdown", config.LoopbackHost, port), http.NoBody)
+	info := &runfile.Info{Port: port, SocketPath: socketPath}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, daemonendpoint.BaseURL(info)+"/shutdown", http.NoBody)
 	if err != nil {
 		return err
 	}
-	resp, err := c.deps.HTTPClient.Do(req)
+	resp, err := daemonendpoint.Client(c.deps.HTTPClient, socketPath).Do(req)
 	if err != nil {
 		return err
 	}

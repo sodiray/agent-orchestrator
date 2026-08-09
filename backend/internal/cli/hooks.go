@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -227,7 +229,7 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 	if hasActivity {
 		req.State = string(state)
 	}
-	if err := c.postJSON(ctx, path, req, nil); err != nil {
+	if err := c.postJSON(ctx, path, req, nil); err != nil && !isUnknownHookSession(err) {
 		// Surface the failure for diagnosis, but exit 0: a failed activity
 		// report must not disrupt the agent.
 		c.reportHookFailure(agent, event, sessionID, err)
@@ -257,10 +259,15 @@ func (c *commandContext) runReviewHook(ctx context.Context, agent, event, review
 	if hasActivity {
 		req.State = string(state)
 	}
-	if err := c.postJSON(ctx, path, req, nil); err != nil {
+	if err := c.postJSON(ctx, path, req, nil); err != nil && !isUnknownHookSession(err) {
 		c.reportHookFailure(agent, event, reviewSessionID, err)
 	}
 	return nil
+}
+
+func isUnknownHookSession(err error) bool {
+	var responseErr apiResponseError
+	return errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusNotFound
 }
 
 func validLaunchID(value string) string {

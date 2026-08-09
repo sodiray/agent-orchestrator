@@ -21,6 +21,12 @@ type proxyStore struct {
 	gets  int
 }
 
+type proxyRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f proxyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func (s *proxyStore) ListRemoteHosts(context.Context) ([]domain.RemoteHost, error) { return nil, nil }
 
 func (s *proxyStore) GetRemoteHost(_ context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error) {
@@ -59,6 +65,86 @@ func TestSessionProxyLeavesBareSessionLocal(t *testing.T) {
 	}
 	if store.gets != 0 {
 		t.Fatalf("GetRemoteHost calls = %d, want 0", store.gets)
+	}
+}
+
+func TestSessionProxyForwardsTargetedCreationAndQualifiesResponse(t *testing.T) {
+	store := &proxyStore{host: domain.RemoteHost{HostID: "workstation", Address: "remote.example:3001", LastProbeSucceeded: true}, found: true}
+	proxy := newProxyForTest(store)
+	proxy.client = &http.Client{Transport: proxyRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/sessions" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "targetHostId") {
+			t.Fatalf("remote body retained target: %s", body)
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"session":{"id":"project-7","projectId":"project","kind":"worker","terminalHandleId":"pane-7"},"promptBytes":10,"systemPromptBytes":20}`))}, nil
+	})}
+	handler := proxy.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("local creation handler should not run")
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"projectId":"project","targetHostId":"workstation","prompt":"fix"}`))
+	request.Header.Set("Authorization", "Bearer local-secret")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, request)
+	if res.Code != http.StatusCreated || !strings.Contains(res.Body.String(), `"id":"workstation~project-7"`) || !strings.Contains(res.Body.String(), `"terminalHandleId":"workstation~pane-7"`) {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestSessionProxyTargetedDelegateQualifiesWorkerID(t *testing.T) {
+	store := &proxyStore{host: domain.RemoteHost{HostID: "workstation", Address: "remote.example:3001", LastProbeSucceeded: true}, found: true}
+	proxy := newProxyForTest(store)
+	proxy.client = &http.Client{Transport: proxyRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/v1/orchestrators/delegate" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusAccepted, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"ok":true,"workerId":"project-7","orchestratorId":"project-orchestrator"}`))}, nil
+	})}
+	handler := proxy.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("local delegate handler should not run")
+	}))
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/orchestrators/delegate", strings.NewReader(`{"projectId":"project","brief":"fix","targetHostId":"workstation"}`)))
+	if res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), `"workerId":"workstation~project-7"`) || !strings.Contains(res.Body.String(), `"orchestratorId":"workstation~project-orchestrator"`) {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestSessionProxyTargetedCreationLeavesUntargetedRequestLocal(t *testing.T) {
+	store := &proxyStore{}
+	called := false
+	handler := newProxyForTest(store).Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != `{"projectId":"project"}` {
+			t.Fatalf("body = %s", body)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"projectId":"project"}`)))
+	if !called || res.Code != http.StatusCreated || store.gets != 0 {
+		t.Fatalf("called=%t status=%d host reads=%d", called, res.Code, store.gets)
+	}
+}
+
+func TestSessionProxyRejectsUnavailableTargetedCreationBeforeLocalHandler(t *testing.T) {
+	store := &proxyStore{host: domain.RemoteHost{HostID: "workstation", LastProbeError: "remote daemon is not listening"}, found: true}
+	handler := newProxyForTest(store).Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("local creation handler should not run")
+	}))
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/sessions", strings.NewReader(`{"projectId":"project","targetHostId":"workstation"}`)))
+	if res.Code != http.StatusServiceUnavailable || !strings.Contains(res.Body.String(), "workstation") || !strings.Contains(res.Body.String(), "remote daemon is not listening") {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 }
 

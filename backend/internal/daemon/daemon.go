@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -84,7 +85,7 @@ func Run() error {
 	}
 	browserBroker := browserruntime.New(log, browserRuntimeToken)
 
-	// Fail fast only if a daemon is genuinely still serving the recorded port.
+	// Fail fast only if a daemon is genuinely still serving the recorded endpoint.
 	// CheckStale confirms the run-file's PID is alive, but that alone is not
 	// proof a predecessor owns the port: the file leaks when the daemon is hard
 	// killed without a graceful shutdown (the norm on Windows, where the desktop
@@ -94,8 +95,8 @@ func Run() error {
 	// predecessor is treated as stale and overwritten when the new server starts.
 	if live, err := runfile.CheckStale(cfg.RunFilePath); err != nil {
 		return fmt.Errorf("inspect run-file: %w", err)
-	} else if live != nil && runFileOwnerServing(&http.Client{Timeout: staleProbeTimeout}, config.LoopbackHost, live) {
-		return fmt.Errorf("daemon already running (pid %d, port %d); refusing to start", live.PID, live.Port)
+	} else if live != nil && runFileOwnerServing(&http.Client{Timeout: staleProbeTimeout}, live) {
+		return fmt.Errorf("daemon already running (pid %d); refusing to start", live.PID)
 	}
 
 	// Open the durable store and bring up the CDC substrate: DB triggers capture
@@ -116,15 +117,20 @@ func Run() error {
 
 	telemetrySink := newTelemetrySink(cfg, store, log)
 	defer func() { _ = telemetrySink.Close(context.Background()) }()
+	startupPayload := map[string]any{
+		"agent": cfg.Agent,
+	}
+	if cfg.UsesUnixSocket() {
+		startupPayload["listener"] = string(config.ListenUnix)
+	} else {
+		startupPayload["port"] = cfg.Port
+	}
 	telemetrySink.Emit(context.Background(), ports.TelemetryEvent{
 		Name:       "ao.daemon.started",
 		Source:     "daemon",
 		OccurredAt: time.Now().UTC(),
 		Level:      ports.TelemetryLevelInfo,
-		Payload: map[string]any{
-			"port":  cfg.Port,
-			"agent": cfg.Agent,
-		},
+		Payload:    startupPayload,
 	})
 
 	// signal.NotifyContext cancels ctx on SIGINT/SIGTERM, which drives the
@@ -252,16 +258,35 @@ func Run() error {
 	lifecycleMessenger.Bind(sessMgr)
 	lcStack.LCM.SetCompletionTerminator(sessMgr)
 	projectSvc := projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink})
-	remoteSessionLister := remotedaemon.NewHTTPSessionLister(nil, 0)
-	remoteHostSvc := remotehostsvc.New(remotehostsvc.Deps{Store: store, Prober: remotedaemon.NewHTTPProber(nil, 0), SessionLister: remoteSessionLister, Logger: log})
+	remoteProbeSessionLister := remotedaemon.NewHTTPSessionLister(nil, cfg.RemoteHostProbeTimeout)
+	var hostInventory remotehostsvc.InventoryProvider
+	if len(cfg.HostInventoryCommand) > 0 {
+		provider, err := remotehostsvc.NewCommandInventoryProvider(cfg.HostInventoryCommand, cfg.HostInventoryTimeout, cfg.HostInventoryMaxOutput)
+		if err != nil {
+			return fmt.Errorf("configure host inventory provider: %w", err)
+		}
+		hostInventory = provider
+	}
+	remoteHostSvc := remotehostsvc.New(remotehostsvc.Deps{
+		Store:             store,
+		Prober:            remotedaemon.NewHTTPProber(nil, cfg.RemoteHostProbeTimeout),
+		SessionLister:     remoteProbeSessionLister,
+		Logger:            log,
+		ProbeTimeout:      cfg.RemoteHostProbeTimeout,
+		Inventory:         hostInventory,
+		InventoryInterval: cfg.HostInventoryInterval,
+	})
 	if err := remoteHostSvc.LoadPresence(ctx); err != nil {
 		return fmt.Errorf("load remote host presence: %w", err)
 	}
+	remoteSessionLister := remotedaemon.NewHTTPSessionLister(nil, 0)
 	federationSvc := federationsvc.New(federationsvc.Deps{
 		Local:              sessionSvc,
+		Projects:           projectSvc,
 		Store:              store,
 		Presence:           remoteHostSvc,
 		Client:             remoteSessionLister,
+		ProjectClient:      remoteSessionLister,
 		Notifications:      notifier,
 		NotificationClient: remotedaemon.NewHTTPSessionLister(nil, 0),
 		Logger:             log,
@@ -412,7 +437,12 @@ func Run() error {
 		}
 		return err
 	}
-	previewDone := preview.NewPoller(store, sessionSvc, "http://"+srv.Addr().String(), preview.PollerConfig{Logger: log}).Start(ctx)
+	previewDone := closedDone()
+	if tcpAddr, ok := srv.Addr().(*net.TCPAddr); ok {
+		previewDone = preview.NewPoller(store, sessionSvc, "http://"+tcpAddr.String(), preview.PollerConfig{Logger: log}).Start(ctx)
+	} else {
+		log.Warn("preview poller disabled: unix daemon listener has no browser-reachable URL")
+	}
 	_ = os.Unsetenv(browserruntime.RuntimeAddressEnv)
 	if ln, addr, err := browserruntime.Listen(cfg.RunFilePath); err != nil {
 		log.Warn("browser runtime: listener unavailable; agent browser control disabled", "err", err)

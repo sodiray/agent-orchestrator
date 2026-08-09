@@ -1,12 +1,14 @@
 // Package config loads the daemon's runtime configuration. The HTTP daemon is
-// a loopback-only sidecar: it binds 127.0.0.1, takes no public traffic, and
-// reads everything it needs from the environment with sane defaults so it can
+// a local-only sidecar: it defaults to 127.0.0.1, may explicitly use a Unix
+// socket, takes no public traffic, and reads operator settings from an optional
+// configuration file and environment variables with sane defaults so it can
 // boot with zero configuration in development.
 package config
 
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -23,7 +25,7 @@ const (
 	// non-default loopback (e.g. ::1, 127.0.0.2) is ever needed, add it back with
 	// an IsLoopback() validator — not a raw env read.
 	LoopbackHost = "127.0.0.1"
-	// DefaultPort is the single port for REST, terminal mux, health, and control.
+	// DefaultPort is the loopback port for REST, terminal mux, health, and control.
 	DefaultPort = 3001
 	// DefaultRequestTimeout bounds a single REST request. Long-lived terminal mux
 	// connections are mounted outside this timeout.
@@ -31,6 +33,13 @@ const (
 	// DefaultShutdownTimeout is the hard cap on graceful shutdown. After this
 	// the process exits even if connections are still draining.
 	DefaultShutdownTimeout = 10 * time.Second
+	// DefaultRemoteHostProbeTimeout bounds one remote host health probe and its
+	// session snapshot refresh. It leaves room for a forwarded connection
+	// to establish while still isolating an unreachable host from other probes.
+	DefaultRemoteHostProbeTimeout = 10 * time.Second
+	DefaultHostInventoryInterval  = 30 * time.Second
+	DefaultHostInventoryTimeout   = 10 * time.Second
+	DefaultHostInventoryMaxOutput = 1 << 20
 	// DefaultAgent is the compatibility value used when AO_AGENT is unset. The
 	// daemon validates it at startup, but worker/orchestrator spawns resolve from
 	// explicit requests or project role config instead of falling back to it.
@@ -84,15 +93,30 @@ var DefaultAllowedOrigins = []string{
 // Config is the fully-resolved daemon configuration. It is immutable once
 // built by Load.
 type Config struct {
+	// Listen selects the daemon listener. It is always ListenLoopback unless
+	// AO_LISTEN explicitly selects a Unix socket.
+	Listen Listener
 	// Host is the bind address. Always loopback — see LoopbackHost.
 	Host string
 	// Port is the TCP port to bind. The daemon fails fast if it is taken.
 	Port int
+	// UnixSocketPath is the absolute filesystem path used when Listen is
+	// ListenUnix. It is empty for the default loopback TCP listener.
+	UnixSocketPath string
 	// RequestTimeout bounds REST request handling.
 	RequestTimeout time.Duration
 	// ShutdownTimeout is the hard graceful-shutdown deadline.
 	ShutdownTimeout time.Duration
-	// RunFilePath is where the PID + port handshake file (running.json) is
+	// RemoteHostProbeTimeout bounds one remote host health probe and its session
+	// snapshot refresh.
+	RemoteHostProbeTimeout time.Duration
+	// HostInventoryCommand is an explicit argv vector. An empty vector disables
+	// host inventory and preserves registered-host-only behavior.
+	HostInventoryCommand   []string
+	HostInventoryInterval  time.Duration
+	HostInventoryTimeout   time.Duration
+	HostInventoryMaxOutput int64
+	// RunFilePath is where the PID + listener handshake file (running.json) is
 	// written so the Electron supervisor can discover and reap the daemon.
 	RunFilePath string
 	// DataDir is the directory holding durable SQLite state: DB and WAL files.
@@ -121,21 +145,42 @@ type Config struct {
 	StartupWorkingDirectory string
 }
 
-// Addr returns the host:port the HTTP server binds. It uses net.JoinHostPort so
-// the result is correct for IPv6 literals as well as IPv4 / hostnames.
+// Listener identifies the daemon listener family.
+type Listener string
+
+const (
+	// ListenLoopback keeps the daemon on its fixed loopback TCP listener.
+	ListenLoopback Listener = "loopback"
+	// ListenUnix selects a Unix-domain socket.
+	ListenUnix Listener = "unix"
+)
+
+// UsesUnixSocket reports whether the daemon listens on a Unix-domain socket.
+func (c Config) UsesUnixSocket() bool { return c.Listen == ListenUnix }
+
+// Addr returns the host:port the loopback HTTP server binds. It uses
+// net.JoinHostPort so the result is correct for IPv6 literals as well as IPv4
+// / hostnames.
 func (c Config) Addr() string {
 	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
-// Load resolves configuration from the environment, applying defaults. It
-// returns an error only for values that are present but malformed (e.g. a
-// non-numeric AO_PORT); missing values fall back to defaults.
+// Load resolves configuration from defaults, the optional config.yaml under
+// AO_DATA_DIR, then the environment. Environment values override file values.
+// It returns an error for malformed supplied values; a missing config file is
+// equivalent to the historical environment-only behavior.
 //
 // Recognised variables:
 //
 //	AO_PORT              bind port           (default 3001)
+//	AO_LISTEN            listener selector   (loopback, or unix:<path>; default loopback)
 //	AO_REQUEST_TIMEOUT   per-request timeout (Go duration > 0, default 60s)
 //	AO_SHUTDOWN_TIMEOUT  shutdown deadline   (Go duration > 0, default 10s)
+//	AO_REMOTE_HOST_PROBE_TIMEOUT remote health probe timeout (Go duration > 0, default 10s)
+//	AO_HOST_INVENTORY_COMMAND JSON argv array for the optional host inventory command
+//	AO_HOST_INVENTORY_INTERVAL inventory refresh interval (Go duration > 0, default 30s)
+//	AO_HOST_INVENTORY_TIMEOUT inventory command timeout (Go duration > 0, default 10s)
+//	AO_HOST_INVENTORY_MAX_OUTPUT maximum inventory stdout bytes (default 1048576)
 //	AO_RUN_FILE          running.json path   (default ~/.ao/running.json)
 //	AO_DATA_DIR          durable state dir   (default ~/.ao/data)
 //	AO_AGENT             compatibility agent id (default claude-code)
@@ -149,29 +194,57 @@ func (c Config) Addr() string {
 //	AO_TELEMETRY_POSTHOG_HOST  PostHog host (default DefaultTelemetryPostHogHost)
 //
 // The bind host is not configurable: the daemon is loopback-only by design.
+// AO_LISTEN may instead select a Unix-domain socket, which has no network
+// reachability and is protected by filesystem permissions.
 func Load() (Config, error) {
+	dataDir, err := resolveDataDir()
+	if err != nil {
+		return Config{}, err
+	}
+	file, configPath, err := loadConfigFile(dataDir)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
-		Host:            LoopbackHost,
-		Port:            DefaultPort,
-		RequestTimeout:  DefaultRequestTimeout,
-		ShutdownTimeout: DefaultShutdownTimeout,
-		Agent:           DefaultAgent,
-		AllowedOrigins:  DefaultAllowedOrigins,
+		Listen:                 ListenLoopback,
+		Host:                   LoopbackHost,
+		Port:                   DefaultPort,
+		RequestTimeout:         DefaultRequestTimeout,
+		ShutdownTimeout:        DefaultShutdownTimeout,
+		RemoteHostProbeTimeout: DefaultRemoteHostProbeTimeout,
+		HostInventoryInterval:  DefaultHostInventoryInterval,
+		HostInventoryTimeout:   DefaultHostInventoryTimeout,
+		HostInventoryMaxOutput: DefaultHostInventoryMaxOutput,
+		Agent:                  DefaultAgent,
+		AllowedOrigins:         DefaultAllowedOrigins,
 		Telemetry: TelemetryConfig{
 			Remote:      TelemetryRemoteOff,
 			PostHogHost: DefaultTelemetryPostHogHost,
 		},
+		DataDir: dataDir,
+	}
+	if err := applyConfigFile(&cfg, file, configPath); err != nil {
+		return Config{}, err
 	}
 
-	if raw := os.Getenv("AO_PORT"); raw != "" {
+	if raw := os.Getenv("AO_LISTEN"); raw != "" {
+		listener, socketPath, err := parseListener(raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Listen = listener
+		cfg.UnixSocketPath = socketPath
+	}
+
+	if raw := os.Getenv("AO_PORT"); raw != "" && !cfg.UsesUnixSocket() {
 		port, err := strconv.Atoi(raw)
 		if err != nil {
 			return Config{}, fmt.Errorf("invalid AO_PORT %q: %w", raw, err)
 		}
-		if port < 1 || port > 65535 {
-			return Config{}, fmt.Errorf("invalid AO_PORT %d: out of range 1-65535", port)
+		if err := applyPort(&cfg, port, "AO_PORT"); err != nil {
+			return Config{}, err
 		}
-		cfg.Port = port
 	}
 
 	if raw := os.Getenv("AO_REQUEST_TIMEOUT"); raw != "" {
@@ -188,6 +261,42 @@ func Load() (Config, error) {
 			return Config{}, err
 		}
 		cfg.ShutdownTimeout = d
+	}
+
+	if raw := os.Getenv("AO_REMOTE_HOST_PROBE_TIMEOUT"); raw != "" {
+		d, err := parsePositiveDuration("AO_REMOTE_HOST_PROBE_TIMEOUT", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.RemoteHostProbeTimeout = d
+	}
+	if raw, ok := os.LookupEnv("AO_HOST_INVENTORY_COMMAND"); ok && raw != "" {
+		command, err := parseCommandArgs("AO_HOST_INVENTORY_COMMAND", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.HostInventoryCommand = command
+	}
+	if raw := os.Getenv("AO_HOST_INVENTORY_INTERVAL"); raw != "" {
+		d, err := parsePositiveDuration("AO_HOST_INVENTORY_INTERVAL", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.HostInventoryInterval = d
+	}
+	if raw := os.Getenv("AO_HOST_INVENTORY_TIMEOUT"); raw != "" {
+		d, err := parsePositiveDuration("AO_HOST_INVENTORY_TIMEOUT", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.HostInventoryTimeout = d
+	}
+	if raw := os.Getenv("AO_HOST_INVENTORY_MAX_OUTPUT"); raw != "" {
+		limit, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || limit <= 0 {
+			return Config{}, fmt.Errorf("invalid AO_HOST_INVENTORY_MAX_OUTPUT %q: must be a positive byte count", raw)
+		}
+		cfg.HostInventoryMaxOutput = limit
 	}
 
 	if raw := os.Getenv("AO_AGENT"); raw != "" {
@@ -208,16 +317,9 @@ func Load() (Config, error) {
 		// also narrow the list. The "null" origin is rejected, never silently
 		// dropped: an operator allowing it would open the no-auth daemon to
 		// every sandboxed iframe on the web.
-		origins := make([]string, 0, 4)
-		for _, origin := range strings.Split(raw, ",") {
-			origin = strings.TrimSpace(origin)
-			if origin == "" {
-				continue
-			}
-			if origin == "null" || origin == "*" {
-				return Config{}, fmt.Errorf("invalid AO_ALLOWED_ORIGINS entry %q: wildcard and null origins are not allowed", origin)
-			}
-			origins = append(origins, origin)
+		origins, err := validateAllowedOrigins(strings.Split(raw, ","), "AO_ALLOWED_ORIGINS")
+		if err != nil {
+			return Config{}, err
 		}
 		cfg.AllowedOrigins = origins
 	}
@@ -256,19 +358,45 @@ func Load() (Config, error) {
 		cfg.Telemetry.AppVersion = strings.TrimSpace(raw)
 	}
 
-	runFile, err := resolveRunFilePath()
+	runFile, err := resolveRunFilePath(cfg.RunFilePath)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.RunFilePath = runFile
 
-	dataDir, err := resolveDataDir()
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.DataDir = dataDir
-
 	return cfg, nil
+}
+
+func parseCommandArgs(name, raw string) ([]string, error) {
+	var args []string
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return nil, fmt.Errorf("invalid %s: must be a JSON array of command arguments: %w", name, err)
+	}
+	if err := validateCommandArgs(name, args, false); err != nil {
+		return nil, err
+	}
+	return args, nil
+}
+
+func parseListener(raw string) (Listener, string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "loopback" {
+		return ListenLoopback, "", nil
+	}
+	if path, ok := strings.CutPrefix(value, "unix:"); ok {
+		if strings.TrimSpace(path) == "" {
+			return "", "", fmt.Errorf("invalid AO_LISTEN %q: unix socket path is required", raw)
+		}
+		abs, err := absOverride("AO_LISTEN", path)
+		if err != nil {
+			return "", "", err
+		}
+		return ListenUnix, abs, nil
+	}
+	if strings.HasPrefix(value, "tcp:") || strings.HasPrefix(value, "tcp://") {
+		return "", "", fmt.Errorf("invalid AO_LISTEN %q: non-loopback TCP hosts are not allowed; use loopback or unix:<path>", raw)
+	}
+	return "", "", fmt.Errorf("invalid AO_LISTEN %q: must be loopback or unix:<path>", raw)
 }
 
 func parseToggleEnv(name, raw string) (bool, error) {
@@ -299,13 +427,7 @@ func parseTelemetryRemote(raw string) (TelemetryRemote, error) {
 // point of the switch is to be usable in a hurry during an incident. An entry
 // that matches no event name is simply inert.
 func parseTelemetryDisabledEvents(raw string) []string {
-	var names []string
-	for _, part := range strings.Split(raw, ",") {
-		if name := strings.TrimSpace(part); name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
+	return filterBlankStrings(strings.Split(raw, ","))
 }
 
 // parsePositiveDuration rejects zero and negative durations: a zero
@@ -335,12 +457,15 @@ func newAppRunID() string {
 	return "apprun-" + hex.EncodeToString(buf)
 }
 
-// resolveRunFilePath picks where running.json lives. An explicit AO_RUN_FILE
-// wins; otherwise it sits under the canonical AO home directory so the CLI and
-// Electron supervisor share one handshake location.
-func resolveRunFilePath() (string, error) {
+// resolveRunFilePath picks where running.json lives. AO_RUN_FILE wins, followed
+// by the optional config file, then the canonical AO home directory so the CLI
+// and Electron supervisor share one handshake location.
+func resolveRunFilePath(configured string) (string, error) {
 	if p, ok := os.LookupEnv("AO_RUN_FILE"); ok && p != "" {
 		return absOverride("AO_RUN_FILE", p)
+	}
+	if configured != "" {
+		return configured, nil
 	}
 	stateDir, err := defaultStateDir()
 	if err != nil {

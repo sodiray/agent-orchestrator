@@ -13,13 +13,17 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	federationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/federation"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
+	remotehostsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/remotehost"
 )
 
 // ProjectsController owns the /projects routes. The controller depends only on
 // projectsvc.Manager; nil keeps routes registered but returns OpenAPI-backed 501s.
 type ProjectsController struct {
-	Mgr projectsvc.Manager
+	Mgr         projectsvc.Manager
+	Federation  *federationsvc.Service
+	RemoteHosts remotehostsvc.Manager
 }
 
 // Register mounts the project routes on the supplied router.
@@ -38,6 +42,16 @@ func (c *ProjectsController) list(w http.ResponseWriter, r *http.Request) {
 		apispec.NotImplemented(w, r, "GET", "/api/v1/projects")
 		return
 	}
+	if c.Federation != nil && r.Header.Get("X-AO-Federation-Local") != "1" {
+		projects, err := c.Federation.ListProjects(r.Context())
+		if err != nil {
+			envelope.WriteError(w, r, err)
+			return
+		}
+		inventory := c.listRemoteHosts(r)
+		envelope.WriteJSON(w, http.StatusOK, ListProjectsResponse{Projects: projects, RemoteHosts: inventory.Hosts, RemoteHostInventoryStale: inventory.Stale, RemoteHostInventoryError: inventory.Reason})
+		return
+	}
 	projects, err := c.Mgr.List(r.Context())
 	if err != nil {
 		envelope.WriteError(w, r, err)
@@ -47,6 +61,17 @@ func (c *ProjectsController) list(w http.ResponseWriter, r *http.Request) {
 		projects = []projectsvc.Summary{}
 	}
 	envelope.WriteJSON(w, http.StatusOK, ListProjectsResponse{Projects: projects})
+}
+
+func (c *ProjectsController) listRemoteHosts(r *http.Request) remotehostsvc.Inventory {
+	if c.Federation == nil || c.RemoteHosts == nil || !c.RemoteHosts.HasHostInventory() {
+		return remotehostsvc.Inventory{}
+	}
+	inventory, err := c.RemoteHosts.Inventory(r.Context())
+	if err != nil {
+		return remotehostsvc.Inventory{Stale: true, Reason: "host inventory could not be loaded"}
+	}
+	return inventory
 }
 
 func (c *ProjectsController) add(w http.ResponseWriter, r *http.Request) {

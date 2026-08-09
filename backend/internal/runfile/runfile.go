@@ -1,5 +1,5 @@
-// Package runfile manages running.json — the PID + port handshake the Electron
-// main process uses to discover, health-check, and reap the daemon. The daemon
+// Package runfile manages running.json — the PID + listener handshake clients
+// use to discover, health-check, and reap the daemon. The daemon
 // writes it on startup and removes it on graceful shutdown. On startup the
 // daemon also checks for a stale entry left by a crashed predecessor so it can
 // fail fast instead of fighting over the port.
@@ -20,8 +20,12 @@ import (
 type Info struct {
 	// PID is the daemon process id.
 	PID int `json:"pid"`
-	// Port is the loopback port the daemon bound.
-	Port int `json:"port"`
+	// Port is the loopback port the daemon bound. It is omitted for a Unix
+	// socket listener because there is no TCP port to connect to.
+	Port int `json:"port,omitempty"`
+	// SocketPath is the Unix-domain socket path the daemon bound. It is empty
+	// for the default loopback TCP listener.
+	SocketPath string `json:"socketPath,omitempty"`
 	// StartedAt is when the daemon came up (RFC 3339).
 	StartedAt time.Time `json:"startedAt"`
 	// Owner records how this daemon was spawned, so the app can decide whether

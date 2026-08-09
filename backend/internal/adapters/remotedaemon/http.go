@@ -10,13 +10,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 )
 
-const DefaultProbeTimeout = 2 * time.Second
+const DefaultProbeTimeout = config.DefaultRemoteHostProbeTimeout
 
 const DefaultSessionListTimeout = 2 * time.Second
 
@@ -32,6 +33,7 @@ type HTTPSessionLister struct {
 }
 
 var _ ports.RemoteDaemonSessionLister = (*HTTPSessionLister)(nil)
+var _ ports.RemoteDaemonProjectLister = (*HTTPSessionLister)(nil)
 var _ ports.RemoteDaemonNotificationLister = (*HTTPSessionLister)(nil)
 
 func NewHTTPSessionLister(client *http.Client, timeout time.Duration) *HTTPSessionLister {
@@ -82,6 +84,52 @@ func (l *HTTPSessionLister) ListSessions(ctx context.Context, address string, fi
 			return nil, fmt.Errorf("remote session list included a qualified session id %q", identity.ID)
 		}
 		out = append(out, domain.RemoteSessionSnapshot{SessionID: identity.ID, View: view})
+	}
+	return out, nil
+}
+
+// ListProjects reads native project rows from an owning daemon. The federation
+// header prevents recursive aggregation when that daemon has remotes of its own.
+func (l *HTTPSessionLister) ListProjects(ctx context.Context, address string) ([]ports.RemoteProjectSummary, error) {
+	listCtx, cancel := context.WithTimeout(ctx, l.timeout)
+	defer cancel()
+	endpoint := url.URL{Scheme: "http", Host: address, Path: "/api/v1/projects"}
+	req, err := http.NewRequestWithContext(listCtx, http.MethodGet, endpoint.String(), nil) // #nosec G704 -- address is an operator-provided remote-host endpoint.
+	if err != nil {
+		return nil, fmt.Errorf("build remote projects request: %w", err)
+	}
+	req.Header.Set("X-AO-Federation-Local", "1")
+	resp, err := l.client.Do(req) // #nosec G704 -- request target is the registered remote-host endpoint.
+	if err != nil {
+		return nil, fmt.Errorf("request remote projects: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("remote project list returned HTTP %d", resp.StatusCode)
+	}
+	var body struct {
+		Projects []struct {
+			ID                domain.ProjectID    `json:"id"`
+			Name              string              `json:"name"`
+			Path              string              `json:"path"`
+			Kind              domain.ProjectKind  `json:"kind"`
+			SessionPrefix     string              `json:"sessionPrefix"`
+			OrchestratorAgent domain.AgentHarness `json:"orchestratorAgent"`
+			ResolveError      string              `json:"resolveError"`
+		} `json:"projects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode remote project list: %w", err)
+	}
+	out := make([]ports.RemoteProjectSummary, 0, len(body.Projects))
+	for _, project := range body.Projects {
+		if project.ID == "" || strings.Contains(string(project.ID), "~") {
+			return nil, fmt.Errorf("remote project list included an invalid project")
+		}
+		out = append(out, ports.RemoteProjectSummary{
+			ID: project.ID, Name: project.Name, Path: project.Path, Kind: project.Kind,
+			SessionPrefix: project.SessionPrefix, OrchestratorAgent: project.OrchestratorAgent, ResolveError: project.ResolveError,
+		})
 	}
 	return out, nil
 }

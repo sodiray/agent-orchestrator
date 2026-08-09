@@ -12,6 +12,7 @@ import {
 	Plus,
 	RefreshCw,
 	Search,
+	Server,
 	Settings,
 	Trash2,
 } from "lucide-react";
@@ -23,6 +24,7 @@ import {
 	newestActiveOrchestrator,
 	type WorkspaceSession,
 	type WorkspaceSummary,
+	type RemoteHostSummary,
 	workerSessions,
 } from "../types/workspace";
 import { getAgentActivityView } from "../lib/session-presentation";
@@ -113,6 +115,9 @@ type SidebarProps = {
 	onPreviewLeave?: () => void;
 	workspaceError?: string;
 	workspaces: WorkspaceSummary[];
+	remoteHosts?: RemoteHostSummary[];
+	remoteHostInventoryStale?: boolean;
+	remoteHostInventoryError?: string;
 	onCreateProject: (input: CreateProjectInput) => Promise<void>;
 	onInitializeProject: (path: string) => Promise<void>;
 	onRemoveProject: (projectId: string) => Promise<void>;
@@ -166,6 +171,9 @@ export function Sidebar({
 	onPreviewLeave,
 	workspaceError,
 	workspaces,
+	remoteHosts = [],
+	remoteHostInventoryStale = false,
+	remoteHostInventoryError,
 	onCreateProject,
 	onInitializeProject,
 	onRemoveProject,
@@ -364,6 +372,33 @@ export function Sidebar({
 			</div>
 
 			<SidebarContent className="gap-0 px-2 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-1.5">
+				{remoteHosts.length > 0 || remoteHostInventoryStale ? (
+					<SidebarGroup className="sidebar-expanded-chrome p-0 pb-3 group-data-[collapsible=icon]:hidden">
+						<SectionDisclosure
+							icon={<Server strokeWidth={1.75} aria-hidden="true" />}
+							label={t("remoteHost.hosts")}
+							collapsible={false}
+						/>
+						<SidebarGroupContent>
+							{remoteHostInventoryStale ? <p className="px-2.5 py-1 text-xs text-warning">{t("remoteHost.inventoryStale")}{remoteHostInventoryError ? `: ${remoteHostInventoryError}` : ""}</p> : null}
+							<SidebarMenu className="gap-0.5">
+								{remoteHosts.map((host) => (
+									<SidebarMenuItem key={host.id}>
+										<div className="flex min-h-9 w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm text-muted-foreground" data-testid="remote-host-row">
+											<span className={cn("size-2 shrink-0 rounded-full", host.state === "available" ? "bg-success" : "bg-warning")} aria-hidden="true" />
+											<span className="min-w-0 flex-1">
+												<span className="block truncate">{host.label}</span>
+												{host.inventoryStale ? <span className="block truncate text-xs text-warning">{t("remoteHost.inventoryStale")}</span> : null}
+												{host.reason ? <span className="block truncate text-xs text-passive">{host.reason}</span> : null}
+											</span>
+											<span className="shrink-0 text-xs text-passive">{t(`remoteHost.state.${host.state}`)}</span>
+										</div>
+									</SidebarMenuItem>
+								))}
+							</SidebarMenu>
+						</SidebarGroupContent>
+					</SidebarGroup>
+				) : null}
 				<SidebarGroup className="p-0">
 					{/* Tree (project-sidebar__tree) */}
 					<SidebarGroupContent>

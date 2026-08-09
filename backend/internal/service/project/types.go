@@ -11,6 +11,20 @@ type Summary struct {
 	SessionPrefix     string              `json:"sessionPrefix"`
 	OrchestratorAgent domain.AgentHarness `json:"orchestratorAgent,omitempty"`
 	ResolveError      string              `json:"resolveError,omitempty"`
+	Sources           []Source            `json:"sources,omitempty"`
+	MetadataConflicts []string            `json:"metadataConflicts,omitempty"`
+}
+
+// Source records where an aggregated project row came from. A missing HostID
+// denotes the local daemon. It is informational only: session operations still
+// route using the session's host-qualified identity.
+type Source struct {
+	HostID            string `json:"hostId,omitempty"`
+	Available         bool   `json:"available"`
+	UnavailableReason string `json:"unavailableReason,omitempty"`
+	Name              string `json:"name"`
+	Path              string `json:"path"`
+	Kind              string `json:"kind"`
 }
 
 // Project is the full read-model returned by GET /api/v1/projects/{id}.

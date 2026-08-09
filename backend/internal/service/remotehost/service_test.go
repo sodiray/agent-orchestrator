@@ -31,6 +31,17 @@ func (s *memoryStore) CreateRemoteHost(_ context.Context, host domain.RemoteHost
 	return true, nil
 }
 
+func (s *memoryStore) UpsertRemoteHost(_ context.Context, host domain.RemoteHost) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.hosts[host.HostID]
+	if exists {
+		host.CreatedAt = current.CreatedAt
+	}
+	s.hosts[host.HostID] = host
+	return !exists, nil
+}
+
 func (s *memoryStore) ListRemoteHosts(_ context.Context) ([]domain.RemoteHost, error) {
 	s.listCalls.Add(1)
 	s.mu.Lock()
@@ -130,6 +141,35 @@ type successfulProber struct {
 	calls atomic.Int64
 }
 
+type inventoryFake struct {
+	mu    sync.Mutex
+	hosts []InventoryHost
+	err   error
+	calls atomic.Int64
+}
+
+func (p *inventoryFake) List(context.Context) ([]InventoryHost, error) {
+	p.calls.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err != nil {
+		return nil, p.err
+	}
+	return append([]InventoryHost(nil), p.hosts...), nil
+}
+
+func (p *inventoryFake) setError(err error) {
+	p.mu.Lock()
+	p.err = err
+	p.mu.Unlock()
+}
+
+func (p *inventoryFake) setHosts(hosts []InventoryHost) {
+	p.mu.Lock()
+	p.hosts = append([]InventoryHost(nil), hosts...)
+	p.mu.Unlock()
+}
+
 func (p *successfulProber) Probe(context.Context, string) error {
 	p.calls.Add(1)
 	return nil
@@ -145,6 +185,40 @@ func (p *blockingProber) Probe(ctx context.Context, _ string) error {
 	p.once.Do(func() { close(p.started) })
 	<-ctx.Done()
 	close(p.finished)
+	return ctx.Err()
+}
+
+type delayedProber struct {
+	delay time.Duration
+}
+
+func (p delayedProber) Probe(ctx context.Context, _ string) error {
+	timer := time.NewTimer(p.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type isolatedProber struct {
+	slowStarted  chan struct{}
+	slowFinished chan struct{}
+	fastStarted  chan struct{}
+	slowOnce     sync.Once
+	fastOnce     sync.Once
+}
+
+func (p *isolatedProber) Probe(ctx context.Context, address string) error {
+	if address != "slow:3001" {
+		p.fastOnce.Do(func() { close(p.fastStarted) })
+		return nil
+	}
+	p.slowOnce.Do(func() { close(p.slowStarted) })
+	<-ctx.Done()
+	close(p.slowFinished)
 	return ctx.Err()
 }
 
@@ -251,8 +325,94 @@ func TestFailedProbeOnlyProducesUnreachable(t *testing.T) {
 	if host.State != domain.RemoteHostStateUnreachable {
 		t.Fatalf("state = %q, want unreachable", host.State)
 	}
-	if host.LastProbeError != "connection refused" {
+	if host.LastProbeError != "remote daemon is not listening (connection refused)" {
 		t.Fatalf("last probe error = %q", host.LastProbeError)
+	}
+}
+
+func TestRegisterUpsertsExistingHostAndCreatesAbsentHost(t *testing.T) {
+	createdAt := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"registered-host": {
+			HostID:        "registered-host",
+			Address:       "127.0.0.1:3001",
+			Label:         "Original",
+			OperatorState: domain.RemoteHostStateStopped,
+			CreatedAt:     createdAt,
+			UpdatedAt:     createdAt,
+		},
+	}}
+	svc := New(Deps{Store: store, Prober: &successfulProber{}})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+
+	updated, err := svc.Register(context.Background(), RegisterInput{HostID: "registered-host", Address: "127.0.0.1:3002", Label: "Updated"})
+	if err != nil {
+		t.Fatalf("upsert registered host: %v", err)
+	}
+	if updated.Address != "127.0.0.1:3002" || updated.Label != "Updated" || updated.State != domain.RemoteHostStateAvailable {
+		t.Fatalf("updated host = %#v", updated)
+	}
+	persisted, found, err := store.GetRemoteHost(context.Background(), "registered-host")
+	if err != nil || !found {
+		t.Fatalf("get updated host: found=%v err=%v", found, err)
+	}
+	if persisted.Address != "127.0.0.1:3002" || persisted.Label != "Updated" || persisted.OperatorState != "" || !persisted.CreatedAt.Equal(createdAt) {
+		t.Fatalf("persisted updated host = %#v", persisted)
+	}
+
+	created, err := svc.Register(context.Background(), RegisterInput{HostID: "new-host", Address: "127.0.0.1:3003"})
+	if err != nil {
+		t.Fatalf("register absent host: %v", err)
+	}
+	if created.HostID != "new-host" || created.Address != "127.0.0.1:3003" || created.State != domain.RemoteHostStateAvailable {
+		t.Fatalf("created host = %#v", created)
+	}
+	if svc.count.Load() != 2 {
+		t.Fatalf("registered-host count = %d, want 2", svc.count.Load())
+	}
+}
+
+func TestProbeHonorsConfiguredTimeoutAndExplainsIt(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}
+	prober := &blockingProber{started: make(chan struct{}), finished: make(chan struct{})}
+	svc := New(Deps{Store: store, Prober: prober, ProbeTimeout: 20 * time.Millisecond})
+
+	started := time.Now()
+	host, err := svc.Register(context.Background(), RegisterInput{HostID: "lab-host", Address: "127.0.0.1:3001"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("configured probe timeout was not honoured; register took %s", elapsed)
+	}
+	if host.State != domain.RemoteHostStateUnreachable {
+		t.Fatalf("state = %q, want unreachable", host.State)
+	}
+	if host.LastProbeError != "remote host did not respond before the timeout" {
+		t.Fatalf("last probe error = %q", host.LastProbeError)
+	}
+	if host.LastProbeError == "remote daemon is not listening (connection refused)" {
+		t.Fatal("timeout and refusal reasons must remain distinct")
+	}
+	select {
+	case <-prober.finished:
+	default:
+		t.Fatal("prober did not observe its configured timeout")
+	}
+}
+
+func TestSlowHealthyProbeWithinConfiguredTimeoutIsAvailable(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}
+	svc := New(Deps{Store: store, Prober: delayedProber{delay: 30 * time.Millisecond}, ProbeTimeout: 60 * time.Millisecond})
+
+	host, err := svc.Register(context.Background(), RegisterInput{HostID: "lab-host", Address: "127.0.0.1:3001"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if host.State != domain.RemoteHostStateAvailable || !host.LastProbeSucceeded || host.LastProbeError != "" {
+		t.Fatalf("host = %#v, want available after a slow healthy probe", host)
 	}
 }
 
@@ -304,7 +464,7 @@ func TestRegisterProbeSnapshotsSessionsBeforeAnyBoardList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("board list: %v", err)
 	}
-	if len(sessions) != 1 || sessions[0].Remote == nil || sessions[0].Remote.Available || sessions[0].Remote.UnavailableReason != "connection refused" {
+	if len(sessions) != 1 || sessions[0].Remote == nil || sessions[0].Remote.Available || sessions[0].Remote.UnavailableReason != "remote daemon is not listening (connection refused)" {
 		t.Fatalf("board sessions = %#v", sessions)
 	}
 }
@@ -360,6 +520,51 @@ func TestProbeAllRunsSlowAndFastHostsConcurrently(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("concurrent probes did not finish")
+	}
+}
+
+func TestProbeAllMakesFastHostAvailableBeforeSlowHostTimesOut(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"slow-host": {HostID: "slow-host", Address: "slow:3001"},
+		"fast-host": {HostID: "fast-host", Address: "fast:3001"},
+	}}
+	prober := &isolatedProber{
+		slowStarted:  make(chan struct{}),
+		slowFinished: make(chan struct{}),
+		fastStarted:  make(chan struct{}),
+	}
+	svc := New(Deps{Store: store, Prober: prober, ProbeTimeout: 100 * time.Millisecond})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.probeAll(context.Background())
+	}()
+	select {
+	case <-prober.slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("slow probe did not start")
+	}
+	select {
+	case <-prober.fastStarted:
+	case <-time.After(time.Second):
+		t.Fatal("fast probe did not start")
+	}
+	waitForRemoteHostTest(t, 50*time.Millisecond, func() bool {
+		host, found, err := store.GetRemoteHost(context.Background(), "fast-host")
+		return err == nil && found && host.LastProbeSucceeded
+	})
+	select {
+	case <-prober.slowFinished:
+		t.Fatal("slow host timed out before fast host became visible")
+	default:
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("slow probe did not finish after its timeout")
 	}
 }
 
@@ -460,6 +665,236 @@ func TestDeregisterWaitsForInFlightHealthProbe(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("deregister returned before the in-flight probe stopped")
 	}
+}
+
+func TestInventoryMergesRegisteredHostByID(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"machine-one": {HostID: "machine-one", Address: "127.0.0.1:3001", Label: "Registered label"},
+	}}
+	provider := &inventoryFake{hosts: []InventoryHost{{HostID: "machine-one", Label: "Inventory label", Lifecycle: InventoryLifecycleRunning, Address: "127.0.0.1:3002"}}}
+	svc := New(Deps{Store: store, Prober: &successfulProber{}, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	svc.probeAll(context.Background())
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if len(inventory.Hosts) != 1 {
+		t.Fatalf("hosts = %#v, want one merged host", inventory.Hosts)
+	}
+	host := inventory.Hosts[0]
+	if host.Label != "Registered label" || host.Address != "127.0.0.1:3002" || host.State != domain.RemoteHostStateAvailable {
+		t.Fatalf("merged host = %#v", host)
+	}
+}
+
+func TestListReturnsOnlyRegisteredHosts(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"registered-host": {HostID: "registered-host", Address: "127.0.0.1:3001"},
+	}}
+	provider := &inventoryFake{hosts: []InventoryHost{
+		{HostID: "inventory-only", Label: "Inventory only", Lifecycle: InventoryLifecycleStopped},
+		{HostID: "registered-host", Label: "Registered host", Lifecycle: InventoryLifecycleRunning, Address: "127.0.0.1:3002"},
+	}}
+	svc := New(Deps{Store: store, Prober: &successfulProber{}, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+
+	hosts, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("list registrations: %v", err)
+	}
+	if len(hosts) != 1 || hosts[0].HostID != "registered-host" || hosts[0].Address != "127.0.0.1:3001" {
+		t.Fatalf("registrations = %#v", hosts)
+	}
+
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("list board inventory: %v", err)
+	}
+	if len(inventory.Hosts) != 2 {
+		t.Fatalf("board inventory = %#v, want both inventory hosts", inventory.Hosts)
+	}
+}
+
+func TestStoppedInventoryHostIsListedWithoutProbe(t *testing.T) {
+	provider := &inventoryFake{hosts: []InventoryHost{{HostID: "machine-one", Label: "Machine one", Lifecycle: InventoryLifecycleStopped}}}
+	prober := &successfulProber{}
+	svc := New(Deps{Store: &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}, Prober: prober, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	svc.probeAll(context.Background())
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if prober.calls.Load() != 0 {
+		t.Fatalf("probe calls = %d, want 0", prober.calls.Load())
+	}
+	if len(inventory.Hosts) != 1 || inventory.Hosts[0].State != domain.RemoteHostStateStopped {
+		t.Fatalf("hosts = %#v, want stopped inventory host", inventory.Hosts)
+	}
+}
+
+func TestRunningInventoryHostProbeFailureIsUnreachable(t *testing.T) {
+	provider := &inventoryFake{hosts: []InventoryHost{{HostID: "machine-one", Label: "Machine one", Lifecycle: InventoryLifecycleRunning, Address: "127.0.0.1:3001"}}}
+	svc := New(Deps{Store: &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}, Prober: &failingProber{}, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	svc.probeAll(context.Background())
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if len(inventory.Hosts) != 1 || inventory.Hosts[0].State != domain.RemoteHostStateUnreachable || inventory.Hosts[0].LastProbeError == "" {
+		t.Fatalf("hosts = %#v, want unreachable host with a reason", inventory.Hosts)
+	}
+}
+
+func TestInventoryFailurePreservesLastKnownHostsAndMarksThemStale(t *testing.T) {
+	provider := &inventoryFake{hosts: []InventoryHost{{HostID: "machine-one", Label: "Machine one", Lifecycle: InventoryLifecycleStopped}}}
+	svc := New(Deps{Store: &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	provider.setError(errors.New("inventory source is unavailable"))
+	svc.refreshInventory(context.Background())
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if !inventory.Stale || inventory.Reason == "" || len(inventory.Hosts) != 1 || !inventory.Hosts[0].InventoryStale || inventory.Hosts[0].InventoryError == "" {
+		t.Fatalf("inventory = %#v", inventory)
+	}
+}
+
+func TestSuccessfulInventoryPrunesRegistrationAfterTwoConsecutiveAbsences(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"machine-one": {HostID: "machine-one", Address: "127.0.0.1:3001"},
+	}}
+	provider := &inventoryFake{hosts: []InventoryHost{{HostID: "machine-one", Label: "Machine one", Lifecycle: InventoryLifecycleStopped}}}
+	svc := New(Deps{Store: store, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+
+	provider.setHosts([]InventoryHost{})
+	svc.refreshInventory(context.Background())
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || !found {
+		t.Fatalf("registration after one successful absence: found=%v err=%v", found, err)
+	}
+
+	svc.refreshInventory(context.Background())
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || found {
+		t.Fatalf("registration after two successful absences: found=%v err=%v", found, err)
+	}
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if len(inventory.Hosts) != 0 {
+		t.Fatalf("board hosts = %#v, want no pruned registration", inventory.Hosts)
+	}
+}
+
+func TestFailedInventoryDoesNotPruneRegistration(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"machine-one": {HostID: "machine-one", Address: "127.0.0.1:3001"},
+	}}
+	provider := &inventoryFake{err: errors.New("inventory source is unavailable")}
+	svc := New(Deps{Store: store, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || !found {
+		t.Fatalf("registration after failed inventory read: found=%v err=%v", found, err)
+	}
+}
+
+func TestStaleInventoryDoesNotAdvanceRegistrationPruning(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"machine-one": {HostID: "machine-one", Address: "127.0.0.1:3001"},
+	}}
+	provider := &inventoryFake{hosts: []InventoryHost{{HostID: "machine-one", Label: "Machine one", Lifecycle: InventoryLifecycleStopped}}}
+	svc := New(Deps{Store: store, Inventory: provider})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+
+	provider.setHosts([]InventoryHost{})
+	svc.refreshInventory(context.Background())
+	provider.setError(errors.New("inventory source is unavailable"))
+	svc.refreshInventory(context.Background())
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if !inventory.Stale {
+		t.Fatal("inventory was not marked stale after a failed refresh")
+	}
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || !found {
+		t.Fatalf("registration while inventory is stale: found=%v err=%v", found, err)
+	}
+
+	provider.setError(nil)
+	svc.refreshInventory(context.Background())
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || !found {
+		t.Fatalf("registration after first successful read following stale inventory: found=%v err=%v", found, err)
+	}
+	svc.refreshInventory(context.Background())
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || found {
+		t.Fatalf("registration after second successful read following stale inventory: found=%v err=%v", found, err)
+	}
+}
+
+func TestNoInventoryProviderNeverPrunesRegistration(t *testing.T) {
+	store := &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{
+		"machine-one": {HostID: "machine-one", Address: "127.0.0.1:3001"},
+	}}
+	svc := New(Deps{Store: store})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	svc.refreshInventory(context.Background())
+
+	if _, found, err := store.GetRemoteHost(context.Background(), "machine-one"); err != nil || !found {
+		t.Fatalf("registration without an inventory provider: found=%v err=%v", found, err)
+	}
+}
+
+func TestNoInventoryConfigurationLeavesRegisteredHostBehaviorUnchanged(t *testing.T) {
+	svc := New(Deps{Store: &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}, Prober: &successfulProber{}})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	if svc.HasHostInventory() {
+		t.Fatal("host inventory reported enabled without a provider or registered host")
+	}
+	inventory, err := svc.Inventory(context.Background())
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if inventory.Stale || inventory.Reason != "" || len(inventory.Hosts) != 0 {
+		t.Fatalf("inventory = %#v, want empty non-stale inventory", inventory)
+	}
+}
+
+func TestInventoryProviderRefreshesPeriodically(t *testing.T) {
+	provider := &inventoryFake{hosts: []InventoryHost{}}
+	svc := New(Deps{Store: &memoryStore{hosts: map[domain.RemoteHostID]domain.RemoteHost{}}, Inventory: provider, InventoryInterval: 10 * time.Millisecond})
+	if err := svc.LoadPresence(context.Background()); err != nil {
+		t.Fatalf("load presence: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.RunHealthProbes(ctx, time.Hour)
+	waitForRemoteHostTest(t, time.Second, func() bool { return provider.calls.Load() >= 2 })
 }
 
 func waitForRemoteHostTest(t *testing.T, timeout time.Duration, condition func() bool) {

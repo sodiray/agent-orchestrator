@@ -5467,6 +5467,8 @@ components:
           type: string
         projectId:
           type: string
+        targetHostId:
+          type: string
       required:
       - projectId
       - brief
@@ -5710,6 +5712,14 @@ components:
         projects:
           items:
             $ref: '#/components/schemas/ProjectSummary'
+          type: array
+        remoteHostInventoryError:
+          type: string
+        remoteHostInventoryStale:
+          type: boolean
+        remoteHosts:
+          items:
+            $ref: '#/components/schemas/RemoteHost'
           type: array
       required:
       - projects
@@ -6148,6 +6158,26 @@ components:
       required:
       - project
       type: object
+    ProjectSource:
+      properties:
+        available:
+          type: boolean
+        hostId:
+          type: string
+        kind:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        unavailableReason:
+          type: string
+      required:
+      - available
+      - name
+      - path
+      - kind
+      type: object
     ProjectSummary:
       properties:
         id:
@@ -6158,6 +6188,10 @@ components:
           - workspace
           - scratch
           type: string
+        metadataConflicts:
+          items:
+            type: string
+          type: array
         name:
           type: string
         orchestratorAgent:
@@ -6168,6 +6202,10 @@ components:
           type: string
         sessionPrefix:
           type: string
+        sources:
+          items:
+            $ref: '#/components/schemas/ProjectSource'
+          type: array
       required:
       - id
       - name
@@ -6248,6 +6286,10 @@ components:
           type: string
         hostId:
           type: string
+        inventoryError:
+          type: string
+        inventoryStale:
+          type: boolean
         label:
           type: string
         lastProbeAt:
@@ -7235,6 +7277,13 @@ components:
           type: string
         prompt:
           maxLength: 4096
+          type: string
+        targetHostId:
+          type: string
+        workspaceMode:
+          enum:
+          - isolated
+          - project-root
           type: string
       required:
       - projectId

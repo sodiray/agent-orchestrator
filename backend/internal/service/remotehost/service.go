@@ -2,27 +2,33 @@ package remotehost
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 )
 
 const (
 	DefaultProbeInterval = 30 * time.Second
-	DefaultProbeTimeout  = 2 * time.Second
+	DefaultProbeTimeout  = config.DefaultRemoteHostProbeTimeout
 
 	remoteHostProbeWorkers = 8
+	inventoryAbsenceReads  = 2
 )
 
 type Store interface {
 	CreateRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error)
+	UpsertRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error)
 	ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error)
 	GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error)
 	RecordRemoteHostProbe(ctx context.Context, id domain.RemoteHostID, at time.Time, succeeded bool, failureReason string) (bool, error)
@@ -34,6 +40,8 @@ type Store interface {
 type Manager interface {
 	Register(ctx context.Context, in RegisterInput) (Host, error)
 	List(ctx context.Context) ([]Host, error)
+	Inventory(ctx context.Context) (Inventory, error)
+	HasHostInventory() bool
 	Get(ctx context.Context, id domain.RemoteHostID) (Host, error)
 	UpdateState(ctx context.Context, id domain.RemoteHostID, state domain.RemoteHostState) (Host, error)
 	Deregister(ctx context.Context, id domain.RemoteHostID) error
@@ -55,15 +63,25 @@ type Host struct {
 	LastProbeError     string                 `json:"lastProbeError,omitempty"`
 	CreatedAt          time.Time              `json:"createdAt"`
 	UpdatedAt          time.Time              `json:"updatedAt"`
+	InventoryStale     bool                   `json:"inventoryStale,omitempty"`
+	InventoryError     string                 `json:"inventoryError,omitempty"`
+}
+
+type Inventory struct {
+	Hosts  []Host
+	Stale  bool
+	Reason string
 }
 
 type Deps struct {
-	Store         Store
-	Prober        ports.RemoteDaemonProber
-	SessionLister ports.RemoteDaemonSessionLister
-	Clock         func() time.Time
-	Logger        *slog.Logger
-	ProbeTimeout  time.Duration
+	Store             Store
+	Prober            ports.RemoteDaemonProber
+	SessionLister     ports.RemoteDaemonSessionLister
+	Clock             func() time.Time
+	Logger            *slog.Logger
+	ProbeTimeout      time.Duration
+	Inventory         InventoryProvider
+	InventoryInterval time.Duration
 }
 
 type Service struct {
@@ -74,11 +92,26 @@ type Service struct {
 	log           *slog.Logger
 	count         atomic.Int64
 
-	probeTimeout  time.Duration
-	probeMu       sync.Mutex
-	probeCtx      context.Context
-	probeInterval time.Duration
-	probeWorker   *healthProbeWorker
+	probeTimeout       time.Duration
+	probeMu            sync.Mutex
+	probeCtx           context.Context
+	probeInterval      time.Duration
+	inventoryInterval  time.Duration
+	probeWorker        *healthProbeWorker
+	inventory          InventoryProvider
+	inventoryRefreshMu sync.Mutex
+	inventoryMu        sync.RWMutex
+	inventoryHosts     map[domain.RemoteHostID]InventoryHost
+	inventoryProbes    map[domain.RemoteHostID]inventoryProbe
+	inventoryAbsences  map[domain.RemoteHostID]int
+	inventoryStale     bool
+	inventoryReason    string
+}
+
+type inventoryProbe struct {
+	at        time.Time
+	succeeded bool
+	reason    string
 }
 
 type healthProbeWorker struct {
@@ -101,7 +134,11 @@ func New(deps Deps) *Service {
 	if probeTimeout <= 0 {
 		probeTimeout = DefaultProbeTimeout
 	}
-	return &Service{store: deps.Store, prober: deps.Prober, sessionLister: deps.SessionLister, clock: clock, log: log, probeTimeout: probeTimeout}
+	inventoryInterval := deps.InventoryInterval
+	if inventoryInterval <= 0 {
+		inventoryInterval = DefaultProbeInterval
+	}
+	return &Service{store: deps.Store, prober: deps.Prober, sessionLister: deps.SessionLister, clock: clock, log: log, probeTimeout: probeTimeout, inventory: deps.Inventory, inventoryInterval: inventoryInterval, inventoryHosts: map[domain.RemoteHostID]InventoryHost{}, inventoryProbes: map[domain.RemoteHostID]inventoryProbe{}, inventoryAbsences: map[domain.RemoteHostID]int{}}
 }
 
 // LoadPresence initializes the in-memory registered-host count during daemon
@@ -114,12 +151,19 @@ func (s *Service) LoadPresence(ctx context.Context) error {
 		return err
 	}
 	s.count.Store(int64(len(hosts)))
+	if s.inventory != nil {
+		s.refreshInventory(ctx)
+	}
 	return nil
 }
 
 // HasRegisteredHosts reports whether federation needs to read the registry.
 func (s *Service) HasRegisteredHosts() bool {
 	return s.count.Load() > 0
+}
+
+func (s *Service) HasHostInventory() bool {
+	return s.HasRegisteredHosts() || s.inventory != nil
 }
 
 func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) {
@@ -145,15 +189,20 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) 
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
-	created, err := s.store.CreateRemoteHost(ctx, host)
+	s.inventoryRefreshMu.Lock()
+	created, err := s.store.UpsertRemoteHost(ctx, host)
 	if err != nil {
+		s.inventoryRefreshMu.Unlock()
 		s.log.Error("register remote host failed", "hostId", id, "err", err)
 		return Host{}, apierr.Internal("REMOTE_HOST_REGISTER_FAILED", "Failed to register remote host")
 	}
-	if !created {
-		return Host{}, apierr.Conflict("REMOTE_HOST_ALREADY_REGISTERED", "A remote host with this id is already registered", nil)
+	if created {
+		s.count.Add(1)
 	}
-	s.count.Add(1)
+	s.inventoryMu.Lock()
+	delete(s.inventoryAbsences, id)
+	s.inventoryMu.Unlock()
+	s.inventoryRefreshMu.Unlock()
 	s.startHealthProbeWorker()
 	return s.probe(ctx, host)
 }
@@ -168,7 +217,33 @@ func (s *Service) List(ctx context.Context) ([]Host, error) {
 	for _, host := range hosts {
 		out = append(out, hostView(host))
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].HostID < out[j].HostID })
 	return out, nil
+}
+
+func (s *Service) Inventory(ctx context.Context) (Inventory, error) {
+	hosts, err := s.store.ListRemoteHosts(ctx)
+	if err != nil {
+		s.log.Error("list remote hosts failed", "err", err)
+		return Inventory{}, apierr.Internal("REMOTE_HOSTS_LIST_FAILED", "Failed to load remote hosts")
+	}
+	inventoryHosts, inventoryProbes, stale, reason := s.inventorySnapshot()
+	registered := make(map[domain.RemoteHostID]domain.RemoteHost, len(hosts))
+	for _, host := range hosts {
+		registered[host.HostID] = host
+	}
+	out := make([]Host, 0, len(hosts)+len(inventoryHosts))
+	for _, host := range hosts {
+		if _, listed := inventoryHosts[host.HostID]; listed {
+			continue
+		}
+		out = append(out, hostView(host))
+	}
+	for id, listed := range inventoryHosts {
+		out = append(out, s.inventoryHostView(listed, registered[id], inventoryProbes[id], stale, reason))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].HostID < out[j].HostID })
+	return Inventory{Hosts: out, Stale: stale, Reason: reason}, nil
 }
 
 func (s *Service) Get(ctx context.Context, id domain.RemoteHostID) (Host, error) {
@@ -243,7 +318,7 @@ func (s *Service) Deregister(ctx context.Context, id domain.RemoteHostID) error 
 			break
 		}
 	}
-	if remaining == 0 {
+	if remaining == 0 && s.inventory == nil {
 		s.stopHealthProbeWorker()
 	}
 	return nil
@@ -270,7 +345,7 @@ func (s *Service) startHealthProbeWorker() {
 }
 
 func (s *Service) startHealthProbeWorkerLocked() {
-	if s.count.Load() == 0 || s.probeWorker != nil || s.probeCtx == nil || s.probeCtx.Err() != nil {
+	if !s.HasHostInventory() || s.probeWorker != nil || s.probeCtx == nil || s.probeCtx.Err() != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(s.probeCtx)
@@ -295,18 +370,27 @@ func (s *Service) stopHealthProbeWorker() {
 func (s *Service) runHealthProbes(ctx context.Context, interval time.Duration, worker *healthProbeWorker) {
 	defer close(worker.done)
 	defer s.finishHealthProbeWorker(worker)
-	if !s.HasRegisteredHosts() {
+	if !s.HasHostInventory() {
 		return
 	}
 	s.probeAll(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var inventoryTicks <-chan time.Time
+	var inventoryTicker *time.Ticker
+	if s.inventory != nil {
+		inventoryTicker = time.NewTicker(s.inventoryInterval)
+		inventoryTicks = inventoryTicker.C
+		defer inventoryTicker.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-inventoryTicks:
+			s.refreshInventory(ctx)
 		case <-ticker.C:
-			if !s.HasRegisteredHosts() {
+			if !s.HasHostInventory() {
 				return
 			}
 			s.probeAll(ctx)
@@ -324,7 +408,7 @@ func (s *Service) finishHealthProbeWorker(worker *healthProbeWorker) {
 }
 
 func (s *Service) probeAll(ctx context.Context) {
-	if !s.HasRegisteredHosts() {
+	if !s.HasHostInventory() {
 		return
 	}
 	hosts, err := s.store.ListRemoteHosts(ctx)
@@ -332,33 +416,61 @@ func (s *Service) probeAll(ctx context.Context) {
 		s.log.Error("list remote hosts for health probe failed", "err", err)
 		return
 	}
-	workers := min(len(hosts), remoteHostProbeWorkers)
+	inventoryHosts, _, _, _ := s.inventorySnapshot()
+	type probeJob func(context.Context) error
+	jobsToRun := make([]probeJob, 0, len(hosts)+len(inventoryHosts))
+	registered := make(map[domain.RemoteHostID]struct{}, len(hosts))
+	for _, host := range hosts {
+		registered[host.HostID] = struct{}{}
+		listed, inInventory := inventoryHosts[host.HostID]
+		if inInventory {
+			if listed.Lifecycle == InventoryLifecycleStopped {
+				continue
+			}
+			host := host
+			jobsToRun = append(jobsToRun, func(ctx context.Context) error { return s.probeInventory(ctx, listed, host) })
+			continue
+		}
+		host := host
+		jobsToRun = append(jobsToRun, func(ctx context.Context) error {
+			_, err := s.probe(ctx, host)
+			return err
+		})
+	}
+	for id, listed := range inventoryHosts {
+		if _, exists := registered[id]; exists || listed.Lifecycle == InventoryLifecycleStopped {
+			continue
+		}
+		listed := listed
+		jobsToRun = append(jobsToRun, func(ctx context.Context) error { return s.probeInventory(ctx, listed, domain.RemoteHost{}) })
+	}
+	workers := min(len(jobsToRun), remoteHostProbeWorkers)
 	if workers == 0 {
 		return
 	}
-	jobs := make(chan domain.RemoteHost)
+	jobs := make(chan probeJob)
 	var group sync.WaitGroup
 	for range workers {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			for host := range jobs {
+			for job := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
-				if _, err := s.probe(ctx, host); err != nil {
-					s.log.Error("remote host health probe recording failed", "hostId", host.HostID, "err", err)
+				if err := job(ctx); err != nil {
+					s.log.Error("remote host health probe recording failed", "err", err)
 				}
 			}
 		}()
 	}
-	for _, host := range hosts {
+	for _, job := range jobsToRun {
 		select {
 		case <-ctx.Done():
 			close(jobs)
 			group.Wait()
 			return
-		case jobs <- host:
+		case jobs <- job:
 		}
 	}
 	close(jobs)
@@ -384,7 +496,7 @@ func (s *Service) probe(ctx context.Context, host domain.RemoteHost) (Host, erro
 	now := s.clock().UTC()
 	failureReason := ""
 	if err != nil {
-		failureReason = err.Error()
+		failureReason = remotedaemonhttp.UnavailabilityReason(err)
 		s.log.Warn("remote host health probe failed", "hostId", host.HostID, "address", host.Address, "err", err)
 	}
 	recorded, recordErr := s.store.RecordRemoteHostProbe(ctx, host.HostID, now, err == nil, failureReason)
@@ -422,6 +534,169 @@ func (s *Service) refreshSnapshots(ctx context.Context, host domain.RemoteHost, 
 	if err := s.store.ReplaceRemoteSessionSnapshots(ctx, host.HostID, snapshots); err != nil {
 		s.log.Error("store remote session snapshots failed", "hostId", host.HostID, "err", err)
 	}
+}
+
+func (s *Service) refreshInventory(ctx context.Context) {
+	if s.inventory == nil {
+		return
+	}
+	hosts, err := s.inventory.List(ctx)
+	if err != nil {
+		s.inventoryMu.Lock()
+		s.inventoryAbsences = map[domain.RemoteHostID]int{}
+		s.inventoryStale = true
+		s.inventoryReason = err.Error()
+		s.inventoryMu.Unlock()
+		s.log.Warn("host inventory refresh failed", "err", err)
+		return
+	}
+	next := make(map[domain.RemoteHostID]InventoryHost, len(hosts))
+	for _, host := range hosts {
+		next[host.HostID] = host
+	}
+	s.inventoryRefreshMu.Lock()
+	defer s.inventoryRefreshMu.Unlock()
+	registered, err := s.store.ListRemoteHosts(ctx)
+	if err != nil {
+		s.log.Error("list remote hosts for inventory reconciliation failed", "err", err)
+	}
+	s.inventoryMu.Lock()
+	previous := s.inventoryHosts
+	s.inventoryHosts = next
+	for id, host := range next {
+		if previousHost, found := previous[id]; !found || previousHost.Address != host.Address {
+			delete(s.inventoryProbes, id)
+		}
+	}
+	for id := range s.inventoryProbes {
+		if _, found := next[id]; !found {
+			delete(s.inventoryProbes, id)
+		}
+	}
+	s.inventoryStale = false
+	s.inventoryReason = ""
+	if err != nil {
+		s.inventoryAbsences = map[domain.RemoteHostID]int{}
+		s.inventoryMu.Unlock()
+		return
+	}
+	prune := s.advanceInventoryAbsences(registered, next)
+	s.inventoryMu.Unlock()
+	for _, id := range prune {
+		deleted, deleteErr := s.store.DeleteRemoteHost(ctx, id)
+		if deleteErr != nil {
+			s.log.Error("prune remote host absent from inventory failed", "hostId", id, "err", deleteErr)
+			continue
+		}
+		if !deleted {
+			continue
+		}
+		for current := s.count.Load(); current > 0; current = s.count.Load() {
+			if s.count.CompareAndSwap(current, current-1) {
+				break
+			}
+		}
+	}
+}
+
+func (s *Service) advanceInventoryAbsences(registered []domain.RemoteHost, inventory map[domain.RemoteHostID]InventoryHost) []domain.RemoteHostID {
+	prune := make([]domain.RemoteHostID, 0)
+	for _, host := range registered {
+		if _, listed := inventory[host.HostID]; listed {
+			delete(s.inventoryAbsences, host.HostID)
+			continue
+		}
+		s.inventoryAbsences[host.HostID]++
+		if s.inventoryAbsences[host.HostID] < inventoryAbsenceReads {
+			continue
+		}
+		delete(s.inventoryAbsences, host.HostID)
+		prune = append(prune, host.HostID)
+	}
+	return prune
+}
+
+func (s *Service) inventorySnapshot() (map[domain.RemoteHostID]InventoryHost, map[domain.RemoteHostID]inventoryProbe, bool, string) {
+	s.inventoryMu.RLock()
+	defer s.inventoryMu.RUnlock()
+	hosts := make(map[domain.RemoteHostID]InventoryHost, len(s.inventoryHosts))
+	for id, host := range s.inventoryHosts {
+		hosts[id] = host
+	}
+	probes := make(map[domain.RemoteHostID]inventoryProbe, len(s.inventoryProbes))
+	for id, probe := range s.inventoryProbes {
+		probes[id] = probe
+	}
+	return hosts, probes, s.inventoryStale, s.inventoryReason
+}
+
+func (s *Service) probeInventory(ctx context.Context, listed InventoryHost, registered domain.RemoteHost) error {
+	address := listed.Address
+	if address == "" {
+		address = registered.Address
+	}
+	if address == "" {
+		s.recordInventoryProbe(listed.HostID, false, "inventory does not provide a remote daemon address")
+		return nil
+	}
+	if s.prober == nil {
+		return errors.New("remote daemon prober is unavailable")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout)
+	defer cancel()
+	err := s.prober.Probe(probeCtx, address)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	reason := ""
+	if err != nil {
+		reason = remotedaemonhttp.UnavailabilityReason(err)
+		s.log.Warn("remote host health probe failed", "hostId", listed.HostID, "address", address, "err", err)
+	}
+	s.recordInventoryProbe(listed.HostID, err == nil, reason)
+	if registered.HostID == "" {
+		return nil
+	}
+	now := s.clock().UTC()
+	if _, recordErr := s.store.RecordRemoteHostProbe(ctx, registered.HostID, now, err == nil, reason); recordErr != nil {
+		return fmt.Errorf("record remote host health: %w", recordErr)
+	}
+	if err == nil {
+		registered.Address = address
+		s.refreshSnapshots(probeCtx, registered, now)
+	}
+	return nil
+}
+
+func (s *Service) recordInventoryProbe(id domain.RemoteHostID, succeeded bool, reason string) {
+	s.inventoryMu.Lock()
+	s.inventoryProbes[id] = inventoryProbe{at: s.clock().UTC(), succeeded: succeeded, reason: reason}
+	s.inventoryMu.Unlock()
+}
+
+func (s *Service) inventoryHostView(listed InventoryHost, registered domain.RemoteHost, probe inventoryProbe, stale bool, inventoryReason string) Host {
+	address := listed.Address
+	if address == "" {
+		address = registered.Address
+	}
+	label := registered.Label
+	if strings.TrimSpace(label) == "" {
+		label = listed.Label
+	}
+	host := domain.RemoteHost{HostID: listed.HostID, Address: address, Label: label, LastProbeAt: probe.at, LastProbeSucceeded: probe.succeeded, LastProbeError: probe.reason, CreatedAt: registered.CreatedAt, UpdatedAt: registered.UpdatedAt}
+	if listed.Lifecycle == InventoryLifecycleStopped {
+		host.OperatorState = domain.RemoteHostStateStopped
+	}
+	if listed.Lifecycle == InventoryLifecycleRunning && address == "" && probe.reason == "" {
+		host.LastProbeError = "inventory does not provide a remote daemon address"
+	}
+	view := hostView(host)
+	view.InventoryStale = stale
+	view.InventoryError = inventoryReason
+	if view.InventoryStale && view.LastProbeError == "" {
+		view.LastProbeError = inventoryReason
+	}
+	return view
 }
 
 func hostView(host domain.RemoteHost) Host {

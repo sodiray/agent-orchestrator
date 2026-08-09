@@ -22,7 +22,7 @@ import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useA
 import { useDaemonStatus } from "../hooks/useDaemonStatus";
 import { useOpenShellTerminal } from "../hooks/useShellTerminals";
 import { useWindowFullScreen } from "../hooks/useWindowFullScreen";
-import { useWorkspaceQuery, workspaceQueryKey, workspaceQueryOptions } from "../hooks/useWorkspaceQuery";
+import { type WorkspaceQueryData, useRemoteHostInventoryStatusQuery, useRemoteHostsQuery, useWorkspaceQuery, workspaceQueryKey, workspaceQueryOptions } from "../hooks/useWorkspaceQuery";
 import { apiClient, apiErrorCode, apiErrorMessage, hasTrustedApiBaseUrl } from "../lib/api-client";
 import { refreshDaemonStatus } from "../lib/daemon-status";
 import { usesPreviewWorkspaceData } from "../lib/preview-mode";
@@ -95,6 +95,8 @@ function ShellLayout() {
 	const queryClient = useQueryClient();
 	const workspaceQuery = useWorkspaceQuery();
 	const workspaces = workspaceQuery.data ?? [];
+	const remoteHosts = useRemoteHostsQuery().data ?? [];
+	const hostInventoryStatus = useRemoteHostInventoryStatusQuery().data;
 	const daemonStatus = useDaemonStatus(queryClient);
 	const [workspaceStartupState, setWorkspaceStartupState] = useState<"loading" | "ready" | "error">("loading");
 	const workspaceStartupBaselineRef = useRef(0);
@@ -222,7 +224,12 @@ function ShellLayout() {
 
 	const updateWorkspaces = useCallback(
 		(updater: (workspaces: WorkspaceSummary[]) => WorkspaceSummary[]) => {
-			queryClient.setQueryData<WorkspaceSummary[]>(workspaceQueryKey, (current = []) => updater(current));
+			queryClient.setQueryData<WorkspaceQueryData>(workspaceQueryKey, (current) => ({
+				workspaces: updater(current?.workspaces ?? []),
+				remoteHosts: current?.remoteHosts ?? [],
+				remoteHostInventoryStale: current?.remoteHostInventoryStale ?? false,
+				remoteHostInventoryError: current?.remoteHostInventoryError,
+			}));
 		},
 		[queryClient],
 	);
@@ -693,6 +700,9 @@ function ShellLayout() {
 						onRemoveProject={removeProject}
 						workspaceError={workspaceQuery.isError ? errorMessage(workspaceQuery.error) : undefined}
 						workspaces={workspaces}
+						remoteHosts={remoteHosts}
+						remoteHostInventoryStale={hostInventoryStatus?.stale}
+						remoteHostInventoryError={hostInventoryStatus?.reason}
 					/>
 					<main className={cn("flex min-w-0 flex-1 flex-col overflow-x-hidden", !isSidebarOpen && "sidebar-hidden")}>
 						<div className="min-h-0 flex-1 overflow-x-hidden">

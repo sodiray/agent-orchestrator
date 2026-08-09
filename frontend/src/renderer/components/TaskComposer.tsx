@@ -27,6 +27,8 @@ import {
 } from "../hooks/useAgentModelsQuery";
 import { AgentModelCombobox } from "./settings/AgentModelCombobox";
 import { SettingsOptionMenu } from "./settings/SettingsOptionMenu";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import type { RemoteHostSummary } from "../types/workspace";
 
 type Project = components["schemas"]["Project"];
 type DelegateAgent = components["schemas"]["DelegateTaskRequest"]["agent"];
@@ -37,6 +39,7 @@ type CreateTaskInput = {
 	agent?: DelegateAgent;
 	model?: string;
 	mode?: "tui";
+	targetHostId?: string;
 	attachments?: FileAttachmentPayload[];
 };
 
@@ -63,6 +66,7 @@ export type TaskComposerProps = {
 	onDirtyChange?: (dirty: boolean) => void;
 	onSubmittingChange?: (submitting: boolean) => void;
 	autoFocusTitle?: boolean;
+	remoteHosts?: RemoteHostSummary[];
 };
 
 export function TaskComposer({
@@ -71,6 +75,7 @@ export function TaskComposer({
 	onDirtyChange,
 	onSubmittingChange,
 	autoFocusTitle,
+	remoteHosts = [],
 }: TaskComposerProps) {
 	const { t } = useTranslation();
 	const queryClient = useQueryClient();
@@ -89,6 +94,9 @@ export function TaskComposer({
 	const [modelWarning, setModelWarning] = useState<string | undefined>();
 	const [canCreateAsTUI, setCanCreateAsTUI] = useState(false);
 	const [isDragging, setIsDragging] = useState(false);
+	const [targetHostId, setTargetHostId] = useState("local");
+	const selectedHost = remoteHosts.find((host) => host.id === targetHostId);
+	const targetUnavailable = selectedHost && selectedHost.state !== "available";
 	const {
 		attachments,
 		error: attachmentError,
@@ -108,6 +116,7 @@ export function TaskComposer({
 						agent: input.agent,
 						model: input.model,
 						...(input.mode ? { mode: input.mode } : {}),
+						...(input.targetHostId ? { targetHostId: input.targetHostId } : {}),
 						...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
 					},
 				});
@@ -220,6 +229,7 @@ export function TaskComposer({
 				agent: selectedAgent ? (selectedAgent as CreateTaskInput["agent"]) : undefined,
 				model: requestedModel,
 				mode: interfaceMode,
+				targetHostId: targetHostId === "local" ? undefined : targetHostId,
 				attachments: attachmentPayloads.length > 0 ? attachmentPayloads : undefined,
 			});
 			onCreated(sessionId);
@@ -363,6 +373,29 @@ export function TaskComposer({
 
 			<div className="composer-toolbar">
 				<div className="composer-run-controls" role="group" aria-label={t("newTask.runsWith")}>
+					{remoteHosts.length > 0 ? (
+						<>
+							<div className="composer-toolbar-slot">
+								<label className="sr-only" htmlFor="task-target-host">
+									{t("remoteHost.runOn")}
+								</label>
+								<Select value={targetHostId} onValueChange={setTargetHostId}>
+									<SelectTrigger id="task-target-host" className="composer-toolbar-option w-full justify-between bg-transparent!" aria-label={t("remoteHost.runOn")}>
+										<SelectValue placeholder={t("remoteHost.local")} />
+									</SelectTrigger>
+									<SelectContent>
+										<SelectItem value="local">{t("remoteHost.local")}</SelectItem>
+										{remoteHosts.map((host) => (
+											<SelectItem key={host.id} value={host.id} disabled={host.state !== "available"}>
+												{host.label} · {t(`remoteHost.state.${host.state}`)}
+											</SelectItem>
+										))}
+									</SelectContent>
+								</Select>
+							</div>
+							<span className="composer-toolbar-divider" aria-hidden="true" />
+						</>
+					) : null}
 					<div className="composer-toolbar-slot">
 						<RequiredAgentField
 							id={agentId}
@@ -421,7 +454,7 @@ export function TaskComposer({
 					type="submit"
 					variant="primary"
 					size="sm"
-					disabled={isSubmitting || !projectId}
+					disabled={isSubmitting || !projectId || Boolean(targetUnavailable)}
 					className="min-w-(--size-composer-start-button)"
 				>
 					{isSubmitting ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : null}

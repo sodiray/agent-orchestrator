@@ -42,7 +42,7 @@ vi.mock("../lib/api-client", () => ({
 }));
 
 import { ProjectSettingsForm } from "./ProjectSettingsForm";
-import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { type WorkspaceQueryData, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import type { WorkspaceSummary } from "../types/workspace";
 
 function renderSettings(projectId = "proj-1", workspaces?: WorkspaceSummary[], section?: "general" | "agents" | "workflow" | "intake") {
@@ -53,7 +53,7 @@ function renderSettings(projectId = "proj-1", workspaces?: WorkspaceSummary[], s
 		},
 	});
 	if (workspaces) {
-		queryClient.setQueryData(workspaceQueryKey, workspaces);
+		queryClient.setQueryData<WorkspaceQueryData>(workspaceQueryKey, { workspaces, remoteHosts: [] });
 	}
 	render(
 		<QueryClientProvider client={queryClient}>

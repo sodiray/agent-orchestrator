@@ -85,5 +85,18 @@ encryption required here while the daemon stays loopback-bound.
 | --- | --- | --- |
 | Remote daemon | Sessions, durable facts, derived display status, runtimes, worktrees, and observations for its machine | Local aggregation or tunnel setup |
 | Forwarding layer | Encrypted path from the local daemon to a remote loopback listener | Session semantics or daemon state |
-| Local daemon | Host registry, aggregation, composite identity, and proxying its public API | Remote runtime, workspace, or source-control operations |
-| Frontend | One daemon API base and its normal views | Host connectivity, federation routing, or a second API base |
+| Local daemon | Host registry, session and project aggregation, composite session identity, and proxying its public API | Remote runtime, workspace, or source-control operations |
+| Frontend | One daemon API base, host inventory and destination selection, and its normal views | Host connectivity, federation routing, or a second API base |
+
+Project aggregation uses project id as an intentional board-only grouping key.
+Matching ids from local and remote daemons are one workspace; it does not turn
+project ids into routable cross-host identities. Session ids remain qualified
+by host for every operation. Paths are retained as source metadata rather than
+used to match projects because equivalent repositories normally have different
+machine-local paths.
+
+The app shows every registered host in its sidebar inventory, including a host
+with no sessions, with its availability state and recorded failure reason. The
+new-task flow presents Local as the default destination and lists remote hosts
+as explicit alternatives. It does not infer a destination from the currently
+selected project because a merged workspace can span multiple hosts.

@@ -219,12 +219,27 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROJECT_ID_REQUIRED", "projectId is required", nil)
 		return
 	}
+	if strings.TrimSpace(in.TargetHostID) != "" {
+		envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "REMOTE_HOST_UNAVAILABLE",
+			fmt.Sprintf("Remote host %q is unavailable: remote host routing is unavailable", strings.TrimSpace(in.TargetHostID)), nil)
+		return
+	}
 	mode, err := domain.ParseSessionMode(string(in.Mode))
 	if err != nil {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "SESSION_MODE_INVALID", err.Error(), nil)
 		return
 	}
 	in.Mode = mode
+	workspaceMode, err := domain.ParseWorkspaceMode(string(in.WorkspaceMode))
+	if err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "WORKSPACE_MODE_INVALID", err.Error(), nil)
+		return
+	}
+	in.WorkspaceMode = workspaceMode
+	if in.WorkspaceMode == domain.WorkspaceModeProjectRoot && strings.TrimSpace(in.Branch) != "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "WORKSPACE_MODE_BRANCH_CONFLICT", "branch cannot be used with workspaceMode project-root", nil)
+		return
+	}
 	if len(in.Prompt) > maxPromptLen {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROMPT_TOO_LONG", "prompt is too long", nil)
 		return
@@ -246,7 +261,7 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", attachErr.code, attachErr.message, nil)
 		return
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, Attachments: attachments})
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, WorkspaceMode: in.WorkspaceMode, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, Attachments: attachments})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -1072,6 +1087,11 @@ func (c *SessionsController) delegateTask(w http.ResponseWriter, r *http.Request
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "PROJECT_ID_REQUIRED", "projectId is required", nil)
 		return
 	}
+	if strings.TrimSpace(in.TargetHostID) != "" {
+		envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "REMOTE_HOST_UNAVAILABLE",
+			fmt.Sprintf("Remote host %q is unavailable: remote host routing is unavailable", strings.TrimSpace(in.TargetHostID)), nil)
+		return
+	}
 	if len(in.Brief) > maxPromptLen {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "TASK_TOO_LONG", "Task is too long", nil)
 		return
@@ -1420,9 +1440,13 @@ func previewFileURL(r *http.Request, id domain.SessionID, entry string) (string,
 }
 
 func sessionView(s domain.Session) SessionView {
+	branch := s.Metadata.Branch
+	if domain.IsProjectRootWorkspaceBranch(branch) {
+		branch = ""
+	}
 	return SessionView{
 		Session:         s,
-		Branch:          s.Metadata.Branch,
+		Branch:          branch,
 		PreviewURL:      s.Metadata.PreviewURL,
 		PreviewRevision: s.Metadata.PreviewRevision,
 		PRs:             sessionPRFacts(s.PRs),

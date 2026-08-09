@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useTranslation } from "react-i18next";
+import { useRemoteHostsQuery } from "../hooks/useWorkspaceQuery";
 import { TaskComposer } from "./TaskComposer";
 
 type NewTaskDialogProps = {
@@ -11,6 +12,7 @@ type NewTaskDialogProps = {
 
 export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewTaskDialogProps) {
 	const { t } = useTranslation();
+	const remoteHosts = useRemoteHostsQuery().data ?? [];
 	return (
 		<Dialog.Root open={open} onOpenChange={onOpenChange}>
 			<Dialog.Portal>
@@ -22,6 +24,7 @@ export function NewTaskDialog({ open, projectId, onCreated, onOpenChange }: NewT
 					<Dialog.Description className="sr-only">{t("newTask.description")}</Dialog.Description>
 					<TaskComposer
 						projectId={projectId}
+						remoteHosts={remoteHosts}
 						autoFocusTitle
 						onCreated={(sessionId) => {
 							onCreated(sessionId);

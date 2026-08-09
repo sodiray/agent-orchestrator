@@ -131,9 +131,13 @@ func (c *commandContext) runDoctor(ctx context.Context) []doctorCheck {
 	if err != nil {
 		return append(checks, doctorCheck{Level: doctorFail, Section: doctorSectionCore, Name: "config", Message: err.Error()})
 	}
+	configMessage := fmt.Sprintf("runFile=%s dataDir=%s port=%d", cfg.RunFilePath, cfg.DataDir, cfg.Port)
+	if cfg.UsesUnixSocket() {
+		configMessage = fmt.Sprintf("runFile=%s dataDir=%s socket=%s", cfg.RunFilePath, cfg.DataDir, cfg.UnixSocketPath)
+	}
 	checks = append(checks, doctorCheck{
 		Level: doctorPass, Section: doctorSectionCore, Name: "config",
-		Message: fmt.Sprintf("runFile=%s dataDir=%s port=%d", cfg.RunFilePath, cfg.DataDir, cfg.Port),
+		Message: configMessage,
 	})
 
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
@@ -161,6 +165,9 @@ func (c *commandContext) runDoctor(ctx context.Context) []doctorCheck {
 		msg := string(st.State)
 		if st.PID != 0 {
 			msg = fmt.Sprintf("%s pid=%d port=%d", msg, st.PID, st.Port)
+			if st.SocketPath != "" {
+				msg = fmt.Sprintf("%s pid=%d socket=%s", string(st.State), st.PID, st.SocketPath)
+			}
 		}
 		if st.Error != "" {
 			msg += " (" + st.Error + ")"
@@ -226,13 +233,9 @@ func checkDataDirWritable(dataDir string) doctorCheck {
 	return doctorCheck{Level: doctorPass, Section: doctorSectionCore, Name: "data-dir-write", Message: "write probe succeeded"}
 }
 
-// checkAOBinary verifies the `ao` that workspace hooks would invoke. Agent
-// adapters install hook commands as a bare `ao hooks <agent> <event>`, so an
-// `ao` earlier on PATH that is not this binary (e.g. a legacy CLI without the
-// hooks command) fails every callback and silently kills activity tracking.
-// The daemon pins PATH inside the sessions it spawns, so a mismatch here is a
-// warning about every other context (manual runs, foreign panes), not a hard
-// failure.
+// checkAOBinary verifies the `ao` legacy workspace hooks would invoke. New
+// installs quote the daemon's absolute executable path, but the warning helps
+// identify pre-existing bare commands before their next spawn repairs them.
 func (c *commandContext) checkAOBinary() doctorCheck {
 	const name = "ao-binary"
 	self, err := c.deps.Executable()
@@ -243,7 +246,7 @@ func (c *commandContext) checkAOBinary() doctorCheck {
 	if err != nil || onPath == "" {
 		return doctorCheck{
 			Level: doctorWarn, Section: doctorSectionTools, Name: name,
-			Message: "ao not found in PATH; workspace hooks invoke `ao hooks <agent> <event>` (daemon-spawned sessions pin PATH to the daemon binary and are unaffected)",
+			Message: "ao not found in PATH; only unrepaired legacy workspace hooks are affected and a spawn repairs them",
 		}
 	}
 	if sameBinary(self, onPath) {
@@ -251,7 +254,7 @@ func (c *commandContext) checkAOBinary() doctorCheck {
 	}
 	return doctorCheck{
 		Level: doctorWarn, Section: doctorSectionTools, Name: name,
-		Message: fmt.Sprintf("ao in PATH is %s, not this binary (%s); workspace hooks run `ao hooks` and a foreign ao breaks activity tracking outside daemon-spawned sessions", onPath, self),
+		Message: fmt.Sprintf("ao in PATH is %s, not this binary (%s); only unrepaired legacy workspace hooks are affected and a spawn repairs them", onPath, self),
 	}
 }
 

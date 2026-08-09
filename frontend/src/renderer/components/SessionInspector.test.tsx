@@ -9,7 +9,7 @@ import type { SessionPRSummary } from "../hooks/useSessionScmSummary";
 import { sessionScmSummaryQueryKey } from "../hooks/useSessionScmSummary";
 import { sessionUsageDetailQueryKey, type SessionUsage } from "../hooks/useSessionUsage";
 import { sessionWorkspaceFilesQueryKey } from "../hooks/useSessionWorkspaceFiles";
-import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { type WorkspaceQueryData, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { useUiStore } from "../stores/ui-store";
 import type { PRState, PullRequestFacts, WorkspaceSession, WorkspaceSummary } from "../types/workspace";
 
@@ -152,7 +152,7 @@ function renderWithQuery(children: ReactNode, workspaces?: WorkspaceSummary[], s
 	const client = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
-	if (workspaces) client.setQueryData(workspaceQueryKey, workspaces);
+	if (workspaces) client.setQueryData<WorkspaceQueryData>(workspaceQueryKey, { workspaces, remoteHosts: [] });
 	seed?.(client);
 	return {
 		...render(
