@@ -41,7 +41,10 @@ func TestRuntimeEnvInjectsBrowserCapability(t *testing.T) {
 		executable:          func() (string, error) { return filepath.Join("/opt", "aod", "ao"), nil },
 		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	env := manager.runtimeEnv("mer-1", "mer", "", nil)
+	env, err := manager.runtimeEnv("mer-1", domain.ProjectRecord{ID: "mer"}, "")
+	if err != nil {
+		t.Fatalf("runtimeEnv: %v", err)
+	}
 	if env[EnvBrowserCapability] != "capability-1" {
 		t.Fatalf("%s = %q", EnvBrowserCapability, env[EnvBrowserCapability])
 	}

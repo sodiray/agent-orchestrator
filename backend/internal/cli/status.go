@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonendpoint"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
@@ -31,17 +32,18 @@ const (
 )
 
 type daemonStatus struct {
-	State     daemonState `json:"state"`
-	PID       int         `json:"pid,omitempty"`
-	Port      int         `json:"port,omitempty"`
-	StartedAt *time.Time  `json:"startedAt,omitempty"`
-	Uptime    string      `json:"uptime,omitempty"`
-	RunFile   string      `json:"runFile"`
-	DataDir   string      `json:"dataDir"`
-	Health    string      `json:"health,omitempty"`
-	Ready     string      `json:"ready,omitempty"`
-	Error     string      `json:"error,omitempty"`
-	owned     bool
+	State      daemonState `json:"state"`
+	PID        int         `json:"pid,omitempty"`
+	Port       int         `json:"port,omitempty"`
+	SocketPath string      `json:"socketPath,omitempty"`
+	StartedAt  *time.Time  `json:"startedAt,omitempty"`
+	Uptime     string      `json:"uptime,omitempty"`
+	RunFile    string      `json:"runFile"`
+	DataDir    string      `json:"dataDir"`
+	Health     string      `json:"health,omitempty"`
+	Ready      string      `json:"ready,omitempty"`
+	Error      string      `json:"error,omitempty"`
+	owned      bool
 }
 
 type probeResult struct {
@@ -90,6 +92,7 @@ func (c *commandContext) inspectDaemon(ctx context.Context) (daemonStatus, error
 
 	st.PID = info.PID
 	st.Port = info.Port
+	st.SocketPath = info.SocketPath
 	startedAt := info.StartedAt
 	st.StartedAt = &startedAt
 	st.Uptime = formatUptime(c.deps.Now().Sub(info.StartedAt))
@@ -100,7 +103,7 @@ func (c *commandContext) inspectDaemon(ctx context.Context) (daemonStatus, error
 		return st, nil
 	}
 
-	health, err := c.readProbe(ctx, info.Port, "healthz")
+	health, err := c.readProbe(ctx, info, "healthz")
 	if err != nil {
 		st.State = stateUnhealthy
 		st.Error = err.Error()
@@ -118,7 +121,7 @@ func (c *commandContext) inspectDaemon(ctx context.Context) (daemonStatus, error
 		return st, nil
 	}
 
-	ready, err := c.readProbe(ctx, info.Port, "readyz")
+	ready, err := c.readProbe(ctx, info, "readyz")
 	if err != nil {
 		st.State = stateNotReady
 		st.Error = err.Error()
@@ -139,15 +142,15 @@ func (c *commandContext) inspectDaemon(ctx context.Context) (daemonStatus, error
 	return st, nil
 }
 
-func (c *commandContext) readProbe(ctx context.Context, port int, path string) (probeResult, error) {
+func (c *commandContext) readProbe(ctx context.Context, info *runfile.Info, path string) (probeResult, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, fmt.Sprintf("http://%s:%d/%s", config.LoopbackHost, port, path), http.NoBody)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, daemonendpoint.BaseURL(info)+"/"+path, http.NoBody)
 	if err != nil {
 		return probeResult{}, err
 	}
-	resp, err := c.deps.HTTPClient.Do(req)
+	resp, err := daemonendpoint.Client(c.deps.HTTPClient, info.SocketPath).Do(req)
 	if err != nil {
 		return probeResult{}, fmt.Errorf("%s: %w", path, err)
 	}
@@ -187,6 +190,11 @@ func writeStatus(cmd *cobra.Command, st daemonStatus) error {
 	}
 	if st.Port != 0 {
 		if _, err := fmt.Fprintf(out, "  port: %d\n", st.Port); err != nil {
+			return err
+		}
+	}
+	if st.SocketPath != "" {
+		if _, err := fmt.Fprintf(out, "  socket: %s\n", st.SocketPath); err != nil {
 			return err
 		}
 	}

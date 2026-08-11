@@ -47,6 +47,13 @@ func TestSpawnCommand_MissingProjectContext(t *testing.T) {
 	}
 }
 
+func TestSpawnCommand_ProjectRootRejectsBranchBeforeDaemonRequest(t *testing.T) {
+	_, _, err := executeCLI(t, Deps{}, "spawn", "--workspace-mode", "project-root", "--branch", "feature", "--name", "worker")
+	if err == nil || !strings.Contains(err.Error(), "--branch cannot be used with --workspace-mode project-root") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 // TestProjectAddCommand_RequiresPath asserts `ao project add` rejects a missing
 // --path before touching the network.
 func TestProjectAddCommand_RequiresPath(t *testing.T) {

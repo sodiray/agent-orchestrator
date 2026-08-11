@@ -16,10 +16,16 @@ const qualifiedSessionSeparator = "~"
 
 var remoteHostIDPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
+// RemoteHostID is the stable operator-chosen slug used to route a qualified
+// identity back to its owning registered daemon.
 type RemoteHostID string
 
+// RemoteHostState describes either the latest connectivity result or an
+// operator-imposed lifecycle state for a registered remote daemon.
 type RemoteHostState string
 
+// Remote host states separate intentional operator stops from probe-derived
+// availability, allowing the UI to explain why a host is unavailable.
 const (
 	RemoteHostStateAvailable   RemoteHostState = "available"
 	RemoteHostStateUnreachable RemoteHostState = "unreachable"
@@ -27,6 +33,8 @@ const (
 	RemoteHostStateDestroyed   RemoteHostState = "destroyed"
 )
 
+// RemoteHost is the durable registry record and most recent probe outcome for
+// a daemon whose sessions may be federated into this AO instance.
 type RemoteHost struct {
 	HostID             RemoteHostID
 	Address            string
@@ -113,6 +121,8 @@ type RemoteSessionSnapshot struct {
 	ObservedAt time.Time
 }
 
+// ValidateRemoteHostID enforces the bounded slug form required to safely embed
+// a host identity in qualified IDs and API routes.
 func ValidateRemoteHostID(id RemoteHostID) error {
 	if len(id) == 0 || len(id) > maxRemoteHostIDLength || !remoteHostIDPattern.MatchString(string(id)) {
 		return fmt.Errorf("remote host id must be a lowercase slug of at most %d characters", maxRemoteHostIDLength)
@@ -120,6 +130,8 @@ func ValidateRemoteHostID(id RemoteHostID) error {
 	return nil
 }
 
+// ValidateRemoteHostAddress accepts only a normalized host:port endpoint so
+// remote client construction never needs to interpret an arbitrary URL.
 func ValidateRemoteHostAddress(address string) error {
 	if strings.TrimSpace(address) != address || address == "" || len(address) > 255 {
 		return fmt.Errorf("remote host address must be a host:port")
@@ -135,6 +147,8 @@ func ValidateRemoteHostAddress(address string) error {
 	return nil
 }
 
+// CurrentState prioritizes an operator's stop or destroy decision over a
+// previous probe result; otherwise it exposes the latest observed reachability.
 func (h RemoteHost) CurrentState() RemoteHostState {
 	if h.OperatorState == RemoteHostStateStopped || h.OperatorState == RemoteHostStateDestroyed {
 		return h.OperatorState

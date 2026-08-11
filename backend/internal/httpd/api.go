@@ -89,7 +89,9 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 			Catalog: deps.Agents,
 		},
 		projects: &controllers.ProjectsController{
-			Mgr: deps.Projects,
+			Mgr:         deps.Projects,
+			Federation:  deps.Federation,
+			RemoteHosts: deps.RemoteHosts,
 		},
 		remoteHosts: &controllers.RemoteHostsController{Mgr: deps.RemoteHosts},
 		federation:  deps.Federation,

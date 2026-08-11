@@ -1,6 +1,47 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
+
+// WorkspaceMode describes whether AO owns and may reclaim a session workspace.
+type WorkspaceMode string
+
+const (
+	// WorkspaceModeIsolated creates AO-managed worktrees (or Scratch directories).
+	WorkspaceModeIsolated WorkspaceMode = "isolated"
+	// WorkspaceModeProjectRoot runs in the registered project's existing directory.
+	WorkspaceModeProjectRoot WorkspaceMode = "project-root"
+	// ProjectRootWorkspaceBranch marks a session whose workspace is the
+	// operator-owned project directory. It is never passed to Git as a ref.
+	ProjectRootWorkspaceBranch = "__ao_project_root__"
+)
+
+// IsProjectRootWorkspaceBranch reports whether branch is AO's durable
+// project-root workspace marker.
+func IsProjectRootWorkspaceBranch(branch string) bool {
+	return branch == ProjectRootWorkspaceBranch
+}
+
+// NormalizeWorkspaceMode preserves the existing isolated-worktree behavior for
+// session rows written before workspace modes existed.
+func NormalizeWorkspaceMode(mode WorkspaceMode) WorkspaceMode {
+	if mode == WorkspaceModeProjectRoot {
+		return mode
+	}
+	return WorkspaceModeIsolated
+}
+
+// ParseWorkspaceMode validates an API/CLI workspace mode. Empty is the
+// backwards-compatible isolated default.
+func ParseWorkspaceMode(raw string) (WorkspaceMode, error) {
+	mode := WorkspaceMode(raw)
+	if mode == "" || mode == WorkspaceModeIsolated || mode == WorkspaceModeProjectRoot {
+		return NormalizeWorkspaceMode(mode), nil
+	}
+	return "", fmt.Errorf("workspaceMode must be \"isolated\" or \"project-root\"")
+}
 
 // These ID types are distinct string types so they can't be swapped at a call
 // site by accident.

@@ -4,6 +4,7 @@ package federation
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -12,20 +13,39 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
+	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
 
-const DefaultListTimeout = 2 * time.Second
+// DefaultListTimeout bounds each remote owner read so a slow host becomes
+// visible as unavailable instead of delaying the local board indefinitely.
+const (
+	DefaultListTimeout    = 2 * time.Second
+	remoteHostListWorkers = 8
+)
 
+// LocalSessions supplies the native session view that federation augments with
+// remote owner views.
 type LocalSessions interface {
 	List(ctx context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error)
 }
 
+// LocalNotifications supplies local notification rows before remote rows and
+// partial-failure state are merged into one response.
 type LocalNotifications interface {
 	List(ctx context.Context, filter notificationsvc.ListFilter) (notificationsvc.ListPage, error)
 }
 
+// LocalProjects supplies local project summaries that are grouped with remote
+// project rows for the board.
+type LocalProjects interface {
+	List(ctx context.Context) ([]projectsvc.Summary, error)
+}
+
+// RemoteHostStore provides the registry and durable snapshot cache needed to
+// preserve remote content during an owning daemon outage.
 type RemoteHostStore interface {
 	ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error)
 	GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error)
@@ -38,33 +58,45 @@ type HostPresence interface {
 	HasRegisteredHosts() bool
 }
 
+// Deps defines federation's local services, remote clients, and registry
+// boundary so aggregation remains independent of concrete adapters.
 type Deps struct {
 	Local              LocalSessions
 	Store              RemoteHostStore
 	Presence           HostPresence
 	Client             ports.RemoteDaemonSessionLister
+	Projects           LocalProjects
+	ProjectClient      ports.RemoteDaemonProjectLister
 	Notifications      LocalNotifications
 	NotificationClient ports.RemoteDaemonNotificationLister
 	Timeout            time.Duration
 	Logger             *slog.Logger
 }
 
+// Service merges local content with remote daemon owner views while keeping
+// failures explicit and preserving last-known remote snapshots.
 type Service struct {
 	local              LocalSessions
 	store              RemoteHostStore
 	presence           HostPresence
 	client             ports.RemoteDaemonSessionLister
+	projects           LocalProjects
+	projectClient      ports.RemoteDaemonProjectLister
 	notifications      LocalNotifications
 	notificationClient ports.RemoteDaemonNotificationLister
 	timeout            time.Duration
 	log                *slog.Logger
 }
 
+// ListedSession represents either a native local session or a remote owner
+// view, allowing callers to preserve their distinct identity semantics.
 type ListedSession struct {
 	Local  *domain.Session
 	Remote *RemoteSession
 }
 
+// RemoteSession retains the owning daemon's serialized view with explicit
+// availability metadata when a snapshot is served during an outage.
 type RemoteSession struct {
 	HostID            domain.RemoteHostID
 	SessionID         domain.SessionID
@@ -73,6 +105,8 @@ type RemoteSession struct {
 	UnavailableReason string
 }
 
+// New creates a federation service with a bounded per-host timeout and a
+// default logger when wiring does not provide one.
 func New(deps Deps) *Service {
 	timeout := deps.Timeout
 	if timeout <= 0 {
@@ -87,11 +121,173 @@ func New(deps Deps) *Service {
 		store:              deps.Store,
 		presence:           deps.Presence,
 		client:             deps.Client,
+		projects:           deps.Projects,
+		projectClient:      deps.ProjectClient,
 		notifications:      deps.Notifications,
 		notificationClient: deps.NotificationClient,
 		timeout:            timeout,
 		log:                log,
 	}
+}
+
+type listedProjectHost struct {
+	host     domain.RemoteHost
+	projects []ports.RemoteProjectSummary
+	reason   string
+}
+
+// ListProjects merges project rows by project id for the board. Project ids are
+// an explicit display grouping key only; all session routing remains based on
+// the host-qualified session id exposed by List.
+func (s *Service) ListProjects(ctx context.Context) ([]projectsvc.Summary, error) {
+	if s.projects == nil {
+		return nil, fmt.Errorf("local project service is unavailable")
+	}
+	local, err := s.projects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s.presence == nil || !s.presence.HasRegisteredHosts() {
+		return local, nil
+	}
+	hosts, err := s.store.ListRemoteHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list registered remote hosts: %w", err)
+	}
+	remote := make([]listedProjectHost, len(hosts))
+	forEachRemoteHost(ctx, hosts, func(index int, host domain.RemoteHost) {
+		remote[index] = s.listProjectHost(ctx, host)
+	})
+	return mergeProjects(local, remote), nil
+}
+
+func (s *Service) listProjectHost(ctx context.Context, host domain.RemoteHost) listedProjectHost {
+	if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
+		reason := fmt.Sprintf("remote host is %s", host.OperatorState)
+		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host), reason: reason}
+	}
+	if s.projectClient == nil {
+		reason := "remote project client is unavailable"
+		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host), reason: reason}
+	}
+	listCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	projects, err := s.projectClient.ListProjects(listCtx, host.Address)
+	if err != nil {
+		s.log.Warn("remote project list failed", "hostId", host.HostID, "address", host.Address, "err", err)
+		reason := remotedaemonhttp.UnavailabilityReason(err)
+		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host), reason: reason}
+	}
+	return listedProjectHost{host: host, projects: projects}
+}
+
+type projectCandidate struct {
+	summary projectsvc.Summary
+	source  projectsvc.Source
+	local   bool
+}
+
+func mergeProjects(local []projectsvc.Summary, remote []listedProjectHost) []projectsvc.Summary {
+	byID := make(map[domain.ProjectID][]projectCandidate, len(local))
+	for _, project := range local {
+		byID[project.ID] = append(byID[project.ID], projectCandidate{
+			summary: project,
+			source:  projectsvc.Source{Name: project.Name, Path: project.Path, Kind: string(project.Kind), Available: true},
+			local:   true,
+		})
+	}
+	for _, result := range remote {
+		for _, project := range result.projects {
+			summary := remoteProjectSummary(project)
+			byID[summary.ID] = append(byID[summary.ID], projectCandidate{
+				summary: summary,
+				source:  projectsvc.Source{HostID: string(result.host.HostID), Name: summary.Name, Path: summary.Path, Kind: string(summary.Kind), Available: result.reason == "", UnavailableReason: result.reason},
+			})
+		}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, string(id))
+	}
+	sort.Strings(ids)
+	out := make([]projectsvc.Summary, 0, len(ids))
+	for _, id := range ids {
+		candidates := byID[domain.ProjectID(id)]
+		sort.SliceStable(candidates, func(left, right int) bool {
+			if candidates[left].local != candidates[right].local {
+				return candidates[left].local
+			}
+			return candidates[left].source.HostID < candidates[right].source.HostID
+		})
+		chosen := candidates[0].summary
+		chosen.Sources = make([]projectsvc.Source, 0, len(candidates))
+		for _, candidate := range candidates {
+			chosen.Sources = append(chosen.Sources, candidate.source)
+		}
+		chosen.MetadataConflicts = projectMetadataConflicts(candidates)
+		out = append(out, chosen)
+	}
+	return out
+}
+
+func remoteProjectSummary(project ports.RemoteProjectSummary) projectsvc.Summary {
+	return projectsvc.Summary{ID: project.ID, Name: project.Name, Path: project.Path, Kind: project.Kind.WithDefault(), SessionPrefix: project.SessionPrefix, OrchestratorAgent: project.OrchestratorAgent, ResolveError: project.ResolveError}
+}
+
+func (s *Service) unavailableProjects(ctx context.Context, host domain.RemoteHost) []ports.RemoteProjectSummary {
+	// A remote project row may not be available during an outage. Snapshot views
+	// still carry projectId, which is enough to retain a workspace for every
+	// cached session instead of allowing it to disappear from the board.
+	snapshots, err := s.store.ListRemoteSessionSnapshots(ctx, host.HostID)
+	if err != nil {
+		s.log.Error("load unavailable remote project snapshots failed", "hostId", host.HostID, "err", err)
+		return nil
+	}
+	ids := make(map[domain.ProjectID]struct{}, len(snapshots))
+	for _, snapshot := range snapshots {
+		var view struct {
+			ProjectID domain.ProjectID `json:"projectId"`
+		}
+		if err := json.Unmarshal(snapshot.View, &view); err != nil || view.ProjectID == "" {
+			continue
+		}
+		ids[view.ProjectID] = struct{}{}
+	}
+	projects := make([]ports.RemoteProjectSummary, 0, len(ids))
+	for id := range ids {
+		projects = append(projects, ports.RemoteProjectSummary{ID: id, Name: string(id), Kind: domain.ProjectKindSingleRepo})
+	}
+	sort.Slice(projects, func(left, right int) bool { return projects[left].ID < projects[right].ID })
+	return projects
+}
+
+func projectMetadataConflicts(candidates []projectCandidate) []string {
+	fields := []struct {
+		name   string
+		values []string
+	}{
+		{name: "name"}, {name: "path"}, {name: "kind"}, {name: "orchestratorAgent"},
+	}
+	for index := range candidates {
+		if !candidates[index].source.Available {
+			continue
+		}
+		fields[0].values = append(fields[0].values, candidates[index].summary.Name)
+		fields[1].values = append(fields[1].values, candidates[index].summary.Path)
+		fields[2].values = append(fields[2].values, string(candidates[index].summary.Kind))
+		fields[3].values = append(fields[3].values, string(candidates[index].summary.OrchestratorAgent))
+	}
+	conflicts := make([]string, 0, len(fields))
+	for _, field := range fields {
+		values := make(map[string]struct{}, len(field.values))
+		for _, value := range field.values {
+			values[value] = struct{}{}
+		}
+		if len(values) > 1 {
+			conflicts = append(conflicts, field.name)
+		}
+	}
+	return conflicts
 }
 
 // RemoteNotificationFailure names a host whose notification list could not be
@@ -142,15 +338,9 @@ func (s *Service) ListNotifications(ctx context.Context, filter notificationsvc.
 		return NotificationListPage{}, fmt.Errorf("list registered remote hosts: %w", err)
 	}
 	remote := make([]listedNotificationHost, len(hosts))
-	var group sync.WaitGroup
-	for index, host := range hosts {
-		group.Add(1)
-		go func(index int, host domain.RemoteHost) {
-			defer group.Done()
-			remote[index] = s.listNotificationHost(ctx, host, filter)
-		}(index, host)
-	}
-	group.Wait()
+	forEachRemoteHost(ctx, hosts, func(index int, host domain.RemoteHost) {
+		remote[index] = s.listNotificationHost(ctx, host, filter)
+	})
 	for index, host := range hosts {
 		result := remote[index]
 		if result.failure != nil {
@@ -239,21 +429,52 @@ func (s *Service) List(ctx context.Context, filter sessionsvc.ListFilter) ([]Lis
 		return nil, fmt.Errorf("list registered remote hosts: %w", err)
 	}
 	remote := make([][]ListedSession, len(hosts))
-	var group sync.WaitGroup
-	for index, host := range hosts {
-		group.Add(1)
-		go func(index int, host domain.RemoteHost) {
-			defer group.Done()
-			remote[index] = s.listHost(ctx, host, filter)
-		}(index, host)
-	}
-	group.Wait()
+	forEachRemoteHost(ctx, hosts, func(index int, host domain.RemoteHost) {
+		remote[index] = s.listHost(ctx, host, filter)
+	})
 	for _, sessions := range remote {
 		out = append(out, sessions...)
 	}
 	return out, nil
 }
 
+// forEachRemoteHost is the shared bounded fan-out for all board aggregation
+// reads. Each callback supplies its own per-host request timeout, while this
+// pool prevents a large registry from creating unbounded concurrent work.
+func forEachRemoteHost(ctx context.Context, hosts []domain.RemoteHost, visit func(index int, host domain.RemoteHost)) {
+	workers := min(len(hosts), remoteHostListWorkers)
+	if workers == 0 {
+		return
+	}
+	jobs := make(chan int)
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for index := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				visit(index, hosts[index])
+			}
+		}()
+	}
+	for index := range hosts {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			group.Wait()
+			return
+		case jobs <- index:
+		}
+	}
+	close(jobs)
+	group.Wait()
+}
+
+// Resolve returns the registry record for a qualified host identity so proxy
+// and stream surfaces can contact only its owning daemon.
 func (s *Service) Resolve(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error) {
 	return s.store.GetRemoteHost(ctx, id)
 }
@@ -287,7 +508,7 @@ func (s *Service) listHost(ctx context.Context, host domain.RemoteHost, filter s
 	defer cancel()
 	snapshots, err := s.client.ListSessions(listCtx, host.Address, remoteSessionFilter(filter))
 	if err != nil {
-		reason := err.Error()
+		reason := remotedaemonhttp.UnavailabilityReason(err)
 		s.log.Warn("remote session list failed", "hostId", host.HostID, "address", host.Address, "err", err)
 		return s.unavailableSnapshots(ctx, host, reason)
 	}

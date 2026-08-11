@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import type { components } from "../../api/schema";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
-import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { type WorkspaceQueryData, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { formatTimeCompact } from "../lib/format-time";
 import { AgentAvatar } from "./AgentAvatar";
 import {
@@ -718,10 +718,14 @@ function CompletionControls({ session }: { session: WorkspaceSession }) {
 		},
 		onMutate: async (terminateOnPrMerge) => {
 			await queryClient.cancelQueries({ queryKey: workspaceQueryKey });
-			const previous = queryClient.getQueryData<WorkspaceSummary[]>(workspaceQueryKey);
-			queryClient.setQueryData<WorkspaceSummary[]>(workspaceQueryKey, (current) =>
-				updateSessionMergePolicy(current, session.id, terminateOnPrMerge),
-			);
+			const previous = queryClient.getQueryData<WorkspaceQueryData>(workspaceQueryKey);
+			queryClient.setQueryData<WorkspaceQueryData>(workspaceQueryKey, (current) => {
+				if (!current) return current;
+				return {
+					...current,
+					workspaces: updateSessionMergePolicy(current.workspaces, session.id, terminateOnPrMerge),
+				};
+			});
 			return { previous };
 		},
 		onError: (_error, _next, context) => {
@@ -735,7 +739,7 @@ function CompletionControls({ session }: { session: WorkspaceSession }) {
 	const canTerminateNow = session.status === "merged";
 
 	const confirmTermination = () => {
-		const workspaces = queryClient.getQueryData<WorkspaceSummary[]>(workspaceQueryKey) ?? [];
+		const workspaces = queryClient.getQueryData<WorkspaceQueryData>(workspaceQueryKey)?.workspaces ?? [];
 		const orchestrator = findProjectOrchestrator(workspaces, session.workspaceId);
 		setConfirmOpen(false);
 		terminate.mutate(session);
@@ -799,11 +803,11 @@ function CompletionControls({ session }: { session: WorkspaceSession }) {
 }
 
 function updateSessionMergePolicy(
-	workspaces: WorkspaceSummary[] | undefined,
+	workspaces: WorkspaceSummary[],
 	sessionId: string,
 	terminateOnPrMerge: boolean,
-): WorkspaceSummary[] | undefined {
-	return workspaces?.map((workspace) => ({
+): WorkspaceSummary[] {
+	return workspaces.map((workspace) => ({
 		...workspace,
 		sessions: workspace.sessions.map((candidate) =>
 			candidate.id === sessionId ? { ...candidate, terminateOnPrMerge } : candidate,

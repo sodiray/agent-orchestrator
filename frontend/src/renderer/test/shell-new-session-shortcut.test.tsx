@@ -122,6 +122,11 @@ vi.mock("../hooks/useWorkspaceQuery", () => ({
 	useWorkspaceQuery: () => shellMocks.state.workspaceQuery,
 	workspaceQueryKey: ["workspaces"],
 	workspaceQueryOptions: {},
+	// This suite covers shortcut subscriptions on a local-only shell, so the
+	// host inventory the layout reads is empty rather than driven, and its
+	// freshness is reported as current.
+	useRemoteHostsQuery: () => ({ data: [] }),
+	useRemoteHostInventoryStatusQuery: () => ({ data: { stale: false, reason: undefined } }),
 }));
 
 vi.mock("../hooks/useDaemonStatus", () => ({

@@ -4,8 +4,8 @@
 
 Federation belongs in the local daemon behind its existing API. The frontend
 continues to address one daemon, while the local daemon lists locally owned and
-remotely owned sessions together and proxies a session-scoped request to the
-daemon named by the session's host.
+remotely owned sessions and projects together and proxies a session-scoped
+request to the daemon named by the session's host.
 
 This placement preserves the frontend's one-base-url model. Today its query
 keys and routes use a bare session id, terminal WebSockets derive from that one
@@ -30,6 +30,11 @@ sequenceDiagram
     Remote-->>Local: remote session read models
     Local-->>UI: sessions with composite identity
 
+    UI->>Local: list projects
+    Local->>Remote: list native projects
+    Remote-->>Local: project summaries
+    Local-->>UI: projects merged by project id
+
     UI->>Local: send or steer (hostId, sessionId)
     Local->>Forward: proxy session-scoped request
     Forward->>Remote: daemon API request
@@ -50,6 +55,30 @@ owning daemon, but must never select a session across the federation.
 This prevents a session on one host from shadowing a same-named session on
 another host and prevents a terminal stream from being routed to the wrong
 machine.
+
+## Project aggregation
+
+`GET /projects` aggregates the local project list with native project lists
+from every registered remote host. The project id is the board grouping key:
+one local project and any number of remote projects with the same id produce a
+single workspace containing all sessions with that `projectId`. This is a
+display relationship only. It never qualifies, routes, invalidates, or opens a
+session; those operations continue to require the `(hostId, sessionId)`
+identity above.
+
+Project ids are intentionally name-like keys rather than globally unique
+repository identities. That means two unrelated repositories configured with
+the same id on different hosts will share a board workspace. This matches the
+operator-facing grouping contract today. A future repository-identity field
+could make this stricter, but path cannot: paths are machine-local and differ
+between otherwise identical checkouts.
+
+When summaries for one id disagree, the local summary wins when present;
+otherwise the remote host with the lexicographically smallest host id wins.
+The response also carries every source and a list of conflicting metadata
+fields (name, path, kind, and orchestrator setting), so the selected summary
+does not hide a potentially misleading difference. Sessions remain visibly
+grouped by their owning host inside the merged workspace.
 
 ## Proxy contract
 
@@ -75,6 +104,27 @@ assembling session lists. Every returned session reference is qualified,
 including nested references and terminal handles, before a client can reuse
 it. This keeps a follow-up action attached to the owning machine even when a
 response contains a session relationship rather than a top-level session.
+
+## Creation targets
+
+Creation has no session id yet, so it cannot use ordinary qualified-id routing.
+`POST /sessions` and the desktop task flow's `POST /orchestrators/delegate`
+accept an optional explicit `targetHostId`. When it is absent, the local daemon
+creates work exactly as it always has. When it names a registered remote host,
+the local daemon checks that host's current availability, removes
+`targetHostId` from the owner-side body, and forwards the same creation request
+to that daemon.
+
+The response is qualified at the federation boundary before returning to the
+client. A created remote session (and its terminal handle, or a delegated
+worker/orchestrator id) is therefore immediately usable through the existing
+session proxy and cannot collide with a same-named local session. The target is
+explicit because a merged project workspace can contain sources from multiple
+machines; a workspace id alone must never silently choose one.
+
+An unavailable, stopped, or destroyed target fails before any owner-side
+request, naming the host and its recorded reason. Creation never falls back to
+local in that case.
 
 A remote session's preview URL is omitted. Its un-rewritten port would resolve
 on the operator's machine, not on the owning machine, and a link to the wrong
@@ -121,6 +171,79 @@ lets the board explain a remote session after a local restart while its owner
 is unavailable, instead of silently making the session disappear. Its display
 status and `activity_state` are still always the owning daemon's values; the
 local daemon never recomputes either from cached or partial facts.
+
+Registered hosts are returned alongside the existing board-project response,
+so the desktop sidebar can show every connected host even when it owns zero
+sessions. This does not change project grouping: hosts are an operator-facing
+inventory and destination picker, while projects remain merged by project id.
+With no registered hosts, the response adds no host data and the frontend makes
+no extra request or renders an empty host affordance.
+
+## Host inventory
+
+Host registration establishes that a daemon has joined the federation. It does
+not establish the operator's machine inventory: a stopped machine cannot
+register, and a machine manager is the authority on whether that machine
+exists and whether it is running. The optional host inventory provider supplies
+that second fact. Reachability remains exclusively the local daemon's probe
+result, so an inventory record never makes a host available by itself.
+
+The provider is enabled only by `AO_HOST_INVENTORY_COMMAND`, a JSON argv array.
+For example, `AO_HOST_INVENTORY_COMMAND='["inventory-command","list","--json"]'`
+runs `inventory-command` directly with `list` and `--json` as arguments. It is
+never passed to a shell. `AO_HOST_INVENTORY_INTERVAL`,
+`AO_HOST_INVENTORY_TIMEOUT`, and `AO_HOST_INVENTORY_MAX_OUTPUT` bound refresh
+frequency, one command execution, and stdout bytes; their defaults are 30s,
+10s, and 1048576 bytes. Without the command, the daemon retains the registered
+host behavior, performs no inventory command or inventory-specific board work,
+and never removes a registration from inventory evidence.
+
+Each successful command writes one JSON value: an array of objects with `id`,
+`label`, and `lifecycle`, plus optional `address`. `id` is the existing
+lowercase host slug; `label` is a non-empty display label of at most 120
+characters; `lifecycle` is either `running` or `stopped`; and `address`, when
+present, is the remote daemon `host:port`. Unknown fields, duplicate ids,
+malformed JSON, oversized output, a timeout, and a non-zero command exit are
+failed refreshes.
+
+An inventory `running` host is probed by the daemon. A successful probe displays
+it as `available`; a failed probe displays it as `unreachable` with the probe's
+reason. An inventory `stopped` host is displayed as `stopped` and is not
+probed. The provider does not supply `available` or `unreachable`, because
+those states would duplicate and potentially contradict the daemon's single
+reachability observation.
+
+Inventory and registration merge by host id. A matching pair produces one host
+row. A non-empty registered label wins over the inventory label, matching the
+project merge rule that the directly owned source wins when present; the
+inventory label is the fallback. A provider address wins when it is present,
+otherwise the registered address is used. The provider lifecycle remains the
+lifecycle authority for its records.
+
+A registration that is absent from two consecutive successful inventory reads
+is removed, together with its cached session snapshots, so a deleted machine
+leaves the board. The first absence leaves the registration visible; requiring
+a second successful read prevents one intermittent partial provider response
+from deleting a live registration. The daemon removes the registration rather
+than marking it `destroyed`: `destroyed` remains an operator-selected state for
+a known host, while inventory-confirmed absence means that no host row remains.
+An inventory read that fails or is stale never advances this confirmation and
+resets an in-progress absence count. The daemon retains the last successful
+inventory and marks it stale instead, because a failed command cannot prove
+that every omitted machine is gone.
+
+The daemon retains the last successful inventory in memory when a refresh
+fails. It marks those rows `inventoryStale` with `inventoryError`, and the
+board response also carries `remoteHostInventoryStale` and
+`remoteHostInventoryError` so a failure after an empty successful inventory is
+still visible. A command failure is therefore never rendered as an empty,
+apparently complete inventory. A later successful empty array means exactly
+that the provider reports no machines.
+
+If a host cannot return its project list, federation derives the minimum
+project rows needed from `projectId` values in those session snapshots. Those
+fallback rows retain each cached session's workspace and carry the host's
+unavailability reason; they do not claim current project metadata.
 
 Forwarded event envelopes qualify `sessionId`, and their payloads qualify every
 session reference, including nested references such as `session`,

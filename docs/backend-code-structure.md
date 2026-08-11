@@ -676,12 +676,14 @@ graph TD
 
 ### `internal/config`
 
-**Purpose:** Environment-based daemon configuration.
+**Purpose:** Daemon configuration from defaults, an optional protected YAML
+file, and environment overrides.
 
 ```mermaid
 graph LR
     Config[config] --> Sources[Sources]
 
+    Sources --> File[$AO_DATA_DIR/config.yaml]
     Sources --> Env[Environment Variables]
     Sources --> Defaults[Built-in Defaults]
     Sources --> Validate[Validation]
@@ -689,6 +691,7 @@ graph LR
     Config -->|provides| Settings[Settings]
 
     Settings --> Port[AO_PORT]
+    Settings --> Listen[AO_LISTEN]
     Settings --> Timeout[AO_REQUEST_TIMEOUT]
     Settings --> DataDir[AO_DATA_DIR]
     Settings --> RunFile[AO_RUN_FILE]
@@ -696,12 +699,18 @@ graph LR
 
 ```
 
+The optional operator file is `$AO_DATA_DIR/config.yaml` (default
+`~/.ao/data/config.yaml`). Environment variables override its values; a missing
+file changes nothing, while an invalid or group/world-writable file stops
+startup. `AO_DATA_DIR` is environment-only because it bootstraps the file path.
+
 **Key environment variables:**
 
 - `AO_PORT` — HTTP bind port (default: 3001)
+- `AO_LISTEN` — daemon listener: `loopback` (default) or `unix:<path>`
 - `AO_REQUEST_TIMEOUT` — Per-request timeout (default: 60s)
 - `AO_SHUTDOWN_TIMEOUT` — Graceful shutdown cap (default: 10s)
-- `AO_RUN_FILE` — PID/port handshake (default: ~/.ao/running.json)
+- `AO_RUN_FILE` — PID/listener handshake (default: ~/.ao/running.json)
 - `AO_DATA_DIR` — SQLite data directory (default: ~/.ao/data)
 - `AO_AGENT` — Compatibility agent adapter (default: claude-code)
 - `GITHUB_TOKEN` — GitHub authentication

@@ -100,7 +100,10 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	// The same env the terminal path builds, including the HookPATH pin. The
 	// provider passes its environment through to the shell commands it runs, so
 	// this is what makes `ao` resolvable to the agent.
-	env := m.runtimeEnv(id, in.cfg.ProjectID, in.cfg.IssueID, in.project.Config.Env)
+	env, err := m.runtimeEnv(id, in.project, in.cfg.IssueID)
+	if err != nil {
+		return domain.SessionRecord{}, err
+	}
 
 	started, err := m.chat.StartChat(ctx, ChatStart{
 		SessionID:             id,
@@ -264,6 +267,10 @@ func (m *Manager) resumeChatController(
 	if err != nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: workspace roots: %w", operation, rec.ID, err)
 	}
+	env, err := m.runtimeEnv(rec.ID, project, rec.IssueID)
+	if err != nil {
+		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, err)
+	}
 	started, err := m.chat.StartChat(ctx, ChatStart{
 		SessionID:             rec.ID,
 		ProjectID:             rec.ProjectID,
@@ -271,7 +278,7 @@ func (m *Manager) resumeChatController(
 		Harness:               rec.Harness,
 		DataDir:               m.dataDir,
 		WorkspacePath:         ws.Path,
-		Env:                   m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env),
+		Env:                   env,
 		Model:                 agentConfig.Model,
 		Permissions:           agentConfig.Permissions,
 		SystemPrompt:          systemPrompt,

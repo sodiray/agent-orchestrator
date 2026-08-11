@@ -10,16 +10,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 )
 
-const DefaultProbeTimeout = 2 * time.Second
+// DefaultProbeTimeout limits a health check so one unavailable remote daemon
+// cannot delay the registry's background probe cycle.
+const DefaultProbeTimeout = config.DefaultRemoteHostProbeTimeout
 
+// DefaultSessionListTimeout bounds board reads from one remote owner and keeps
+// a slow network peer from holding up the local response indefinitely.
 const DefaultSessionListTimeout = 2 * time.Second
 
+// HTTPProber checks whether a registered daemon is serving the expected health
+// contract over its configured address.
 type HTTPProber struct {
 	client  *http.Client
 	timeout time.Duration
@@ -32,8 +39,11 @@ type HTTPSessionLister struct {
 }
 
 var _ ports.RemoteDaemonSessionLister = (*HTTPSessionLister)(nil)
+var _ ports.RemoteDaemonProjectLister = (*HTTPSessionLister)(nil)
 var _ ports.RemoteDaemonNotificationLister = (*HTTPSessionLister)(nil)
 
+// NewHTTPSessionLister builds a remote read client that refuses redirects so a
+// registered host cannot cause federation traffic to leave its configured peer.
 func NewHTTPSessionLister(client *http.Client, timeout time.Duration) *HTTPSessionLister {
 	if timeout <= 0 {
 		timeout = DefaultSessionListTimeout
@@ -41,12 +51,14 @@ func NewHTTPSessionLister(client *http.Client, timeout time.Duration) *HTTPSessi
 	return &HTTPSessionLister{client: remotedaemonhttp.EnforceRedirectRefusal(client), timeout: timeout}
 }
 
+// ListSessions fetches bare session views from one owning daemon for local
+// federation to qualify, rejecting nested identities at the trust boundary.
 func (l *HTTPSessionLister) ListSessions(ctx context.Context, address string, filter ports.RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error) {
 	listCtx, cancel := context.WithTimeout(ctx, l.timeout)
 	defer cancel()
 	endpoint := url.URL{Scheme: "http", Host: address, Path: "/api/v1/sessions"}
 	endpoint.RawQuery = remoteSessionQuery(filter).Encode()
-	req, err := http.NewRequestWithContext(listCtx, http.MethodGet, endpoint.String(), nil) // #nosec G704 -- address is an operator-provided remote-host endpoint.
+	req, err := http.NewRequestWithContext(listCtx, http.MethodGet, endpoint.String(), http.NoBody) // #nosec G704 -- address is an operator-provided remote-host endpoint.
 	if err != nil {
 		return nil, fmt.Errorf("build remote session request: %w", err)
 	}
@@ -86,6 +98,52 @@ func (l *HTTPSessionLister) ListSessions(ctx context.Context, address string, fi
 	return out, nil
 }
 
+// ListProjects reads native project rows from an owning daemon. The federation
+// header prevents recursive aggregation when that daemon has remotes of its own.
+func (l *HTTPSessionLister) ListProjects(ctx context.Context, address string) ([]ports.RemoteProjectSummary, error) {
+	listCtx, cancel := context.WithTimeout(ctx, l.timeout)
+	defer cancel()
+	endpoint := url.URL{Scheme: "http", Host: address, Path: "/api/v1/projects"}
+	req, err := http.NewRequestWithContext(listCtx, http.MethodGet, endpoint.String(), http.NoBody) // #nosec G704 -- address is an operator-provided remote-host endpoint.
+	if err != nil {
+		return nil, fmt.Errorf("build remote projects request: %w", err)
+	}
+	req.Header.Set("X-AO-Federation-Local", "1")
+	resp, err := l.client.Do(req) // #nosec G704 -- request target is the registered remote-host endpoint.
+	if err != nil {
+		return nil, fmt.Errorf("request remote projects: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("remote project list returned HTTP %d", resp.StatusCode)
+	}
+	var body struct {
+		Projects []struct {
+			ID                domain.ProjectID    `json:"id"`
+			Name              string              `json:"name"`
+			Path              string              `json:"path"`
+			Kind              domain.ProjectKind  `json:"kind"`
+			SessionPrefix     string              `json:"sessionPrefix"`
+			OrchestratorAgent domain.AgentHarness `json:"orchestratorAgent"`
+			ResolveError      string              `json:"resolveError"`
+		} `json:"projects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode remote project list: %w", err)
+	}
+	out := make([]ports.RemoteProjectSummary, 0, len(body.Projects))
+	for _, project := range body.Projects {
+		if project.ID == "" || strings.Contains(string(project.ID), "~") {
+			return nil, fmt.Errorf("remote project list included an invalid project")
+		}
+		out = append(out, ports.RemoteProjectSummary{
+			ID: project.ID, Name: project.Name, Path: project.Path, Kind: project.Kind,
+			SessionPrefix: project.SessionPrefix, OrchestratorAgent: project.OrchestratorAgent, ResolveError: project.ResolveError,
+		})
+	}
+	return out, nil
+}
+
 // ListNotifications reads native notification rows from an owning daemon. The
 // federation header prevents a remote daemon from recursively aggregating its
 // own registered hosts into this owner's response.
@@ -100,7 +158,7 @@ func (l *HTTPSessionLister) ListNotifications(ctx context.Context, address strin
 		query.Set("cursor", cursor)
 	}
 	endpoint.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(listCtx, http.MethodGet, endpoint.String(), nil) // #nosec G704 -- address is an operator-provided remote-host endpoint.
+	req, err := http.NewRequestWithContext(listCtx, http.MethodGet, endpoint.String(), http.NoBody) // #nosec G704 -- address is an operator-provided remote-host endpoint.
 	if err != nil {
 		return ports.RemoteNotificationListPage{}, fmt.Errorf("build remote notification request: %w", err)
 	}
@@ -170,6 +228,8 @@ func remoteSessionQuery(filter ports.RemoteSessionListFilter) url.Values {
 	return query
 }
 
+// NewHTTPProber builds a health prober with redirect refusal and a bounded
+// timeout, preserving the configured host as the sole probe destination.
 func NewHTTPProber(client *http.Client, timeout time.Duration) *HTTPProber {
 	if timeout <= 0 {
 		timeout = DefaultProbeTimeout
@@ -177,10 +237,12 @@ func NewHTTPProber(client *http.Client, timeout time.Duration) *HTTPProber {
 	return &HTTPProber{client: remotedaemonhttp.EnforceRedirectRefusal(client), timeout: timeout}
 }
 
+// Probe verifies that address answers as an Agent Orchestrator daemon rather
+// than merely accepting a TCP connection.
 func (p *HTTPProber) Probe(ctx context.Context, address string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+address+"/healthz", nil) // #nosec G704 -- address is an operator-provided remote-host endpoint.
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+address+"/healthz", http.NoBody) // #nosec G704 -- address is an operator-provided remote-host endpoint.
 	if err != nil {
 		return fmt.Errorf("build health probe request: %w", err)
 	}

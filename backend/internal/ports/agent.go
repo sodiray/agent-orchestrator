@@ -349,9 +349,12 @@ type LaunchConfig struct {
 
 // WorkspaceHookConfig carries inputs needed to install workspace-local agent hooks.
 type WorkspaceHookConfig struct {
-	Config           AgentConfig
-	DataDir          string
-	Env              map[string]string
+	Config  AgentConfig
+	DataDir string
+	Env     map[string]string
+	// ExecutablePath is the absolute path to the AO daemon executable that
+	// installed the hooks. Hook runners do not inherit a reliable PATH.
+	ExecutablePath   string
 	SessionID        string
 	SystemPrompt     string
 	SystemPromptFile string

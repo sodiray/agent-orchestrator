@@ -28,8 +28,8 @@ const (
 	eventsReplayBatch = 512
 	eventsLiveBuffer  = 1024
 
-	remoteEventsReconnectMin = 100 * time.Millisecond
-	remoteEventsReconnectMax = 5 * time.Second
+	remoteEventsReconnectMinimum = 100 * time.Millisecond
+	remoteEventsReconnectMax     = 5 * time.Second
 )
 
 type cdcSubscriber interface {
@@ -209,7 +209,7 @@ func (c *EventsController) readRemoteEvents(ctx context.Context, host domain.Rem
 		query.Set("tail", "1")
 	}
 	endpoint.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil) // #nosec G704 -- target is a registered remote-host endpoint.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), http.NoBody) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
 		return fmt.Errorf("build remote event request: %w", err)
 	}
@@ -246,7 +246,7 @@ func (c *EventsController) logger() *slog.Logger {
 }
 
 func waitForRemoteEventsRetry(ctx context.Context, attempt int) bool {
-	delay := remoteEventsReconnectMin << min(attempt, 5)
+	delay := remoteEventsReconnectMinimum << min(attempt, 5)
 	if delay > remoteEventsReconnectMax {
 		delay = remoteEventsReconnectMax
 	}

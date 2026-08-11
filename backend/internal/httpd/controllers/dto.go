@@ -31,22 +31,32 @@ type ProjectIDParam struct {
 	ID string `path:"id" description:"Project identifier (registry key)."`
 }
 
+// RemoteHostIDParam is the operator-supplied host identity carried in remote
+// host routes and reflected into the OpenAPI path contract.
 type RemoteHostIDParam struct {
 	HostID string `path:"hostId" description:"Operator-supplied remote host identifier."`
 }
 
+// ListRemoteHostsResponse is the collection envelope returned by the remote
+// host registry endpoint.
 type ListRemoteHostsResponse struct {
 	RemoteHosts []remotehostsvc.Host `json:"remoteHosts"`
 }
 
+// RemoteHostResponse wraps one remote-host view for create, get, and state
+// update responses, keeping those wire shapes consistent.
 type RemoteHostResponse struct {
 	RemoteHost remotehostsvc.Host `json:"remoteHost"`
 }
 
+// UpdateRemoteHostStateRequest carries an explicit operator lifecycle decision
+// for a remote daemon.
 type UpdateRemoteHostStateRequest struct {
 	State string `json:"state" enum:"available,stopped,destroyed"`
 }
 
+// DeregisterRemoteHostResponse confirms which remote-host identity was removed
+// after a successful deregistration request.
 type DeregisterRemoteHostResponse struct {
 	HostID string `json:"hostId"`
 }
@@ -58,7 +68,10 @@ type AgentIDParam struct {
 
 // ListProjectsResponse is the body of GET /api/v1/projects.
 type ListProjectsResponse struct {
-	Projects []projectsvc.Summary `json:"projects"`
+	Projects                 []projectsvc.Summary `json:"projects"`
+	RemoteHosts              []remotehostsvc.Host `json:"remoteHosts,omitempty"`
+	RemoteHostInventoryStale bool                 `json:"remoteHostInventoryStale,omitempty"`
+	RemoteHostInventoryError string               `json:"remoteHostInventoryError,omitempty"`
 }
 
 // ProjectResponse is the { project } body shared by POST /projects (201).
@@ -181,11 +194,17 @@ type ListSessionsResponse struct {
 
 // SpawnSessionRequest is the body of POST /api/v1/sessions.
 type SpawnSessionRequest struct {
-	ProjectID domain.ProjectID    `json:"projectId"`
-	IssueID   domain.IssueID      `json:"issueId,omitempty"`
-	Kind      domain.SessionKind  `json:"kind,omitempty" enum:"worker,orchestrator"`
-	Harness   domain.AgentHarness `json:"harness,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,muse,kiro,kilocode,vibe,pi,autohand"`
-	Branch    string              `json:"branch,omitempty"`
+	ProjectID domain.ProjectID `json:"projectId"`
+	// TargetHostID selects a registered remote owner for this creation. Omitted
+	// retains the existing local-creation behavior.
+	TargetHostID string              `json:"targetHostId,omitempty"`
+	IssueID      domain.IssueID      `json:"issueId,omitempty"`
+	Kind         domain.SessionKind  `json:"kind,omitempty" enum:"worker,orchestrator"`
+	Harness      domain.AgentHarness `json:"harness,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,muse,kiro,kilocode,vibe,pi,autohand"`
+	Branch       string              `json:"branch,omitempty"`
+	// WorkspaceMode selects AO's default isolated workspace or the registered
+	// project directory. project-root accepts only one active session per project.
+	WorkspaceMode domain.WorkspaceMode `json:"workspaceMode,omitempty" enum:"isolated,project-root"`
 	// Mode picks the conversation controller: chat talks to the agent over a
 	// structured connection, tui opens the agent's native terminal interface.
 	// Omitted resolves to the daemon default (tui), which is why an upgrade
@@ -500,10 +519,13 @@ type SendSessionMessageResponse struct {
 // DelegateTaskRequest is the body of POST /api/v1/orchestrators/delegate.
 // An omitted agent tells the orchestrator to use the project's worker default.
 type DelegateTaskRequest struct {
-	ProjectID domain.ProjectID    `json:"projectId"`
-	Brief     string              `json:"brief" maxLength:"4096"`
-	Agent     domain.AgentHarness `json:"agent,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,muse,kiro,kilocode,vibe,pi,autohand,fake"`
-	Model     string              `json:"model,omitempty" maxLength:"256"`
+	ProjectID domain.ProjectID `json:"projectId"`
+	// TargetHostID selects a registered remote owner for this worker. Omitted
+	// retains the existing local-creation behavior.
+	TargetHostID string              `json:"targetHostId,omitempty"`
+	Brief        string              `json:"brief" maxLength:"4096"`
+	Agent        domain.AgentHarness `json:"agent,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,muse,kiro,kilocode,vibe,pi,autohand,fake"`
+	Model        string              `json:"model,omitempty" maxLength:"256"`
 	// Mode is omitted for the daemon-owned default. The UI sends tui only when
 	// the user explicitly accepts the fallback after Chat preflight fails.
 	Mode domain.SessionMode `json:"mode,omitempty" enum:"tui,chat"`
@@ -737,6 +759,7 @@ type SetActivityRequest struct {
 	ToolUseID      string             `json:"toolUseId,omitempty" description:"Native tool-use id, for tool-use hook events."`
 	AgentSessionID string             `json:"agentSessionId,omitempty" description:"Native agent session identifier used to resume its transcript."`
 	LaunchID       string             `json:"launchId,omitempty" description:"AO process generation that produced the signal."`
+	Prompt         string             `json:"prompt,omitempty" description:"User message body, sent with user-prompt-submit so a session can name itself from its first prompt."`
 	Usage          *UsageHookMetadata `json:"usage,omitempty" description:"Provider transcript metadata used by the local usage pipeline."`
 }
 

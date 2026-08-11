@@ -2,10 +2,10 @@ package daemon
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonendpoint"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
@@ -15,7 +15,7 @@ import (
 const staleProbeTimeout = 2 * time.Second
 
 // runFileOwnerServing reports whether an AO daemon matching info is actually
-// serving on the recorded loopback port.
+// serving on the recorded endpoint.
 //
 // runfile.CheckStale only confirms the recorded PID is alive, which is not
 // enough to conclude a predecessor still owns the port. On Windows the desktop
@@ -29,16 +29,16 @@ const staleProbeTimeout = 2 * time.Second
 // Probing /healthz and matching both the service name and the PID is the ground
 // truth that a real predecessor is still listening. When it is not, the
 // run-file is stale and the caller should overwrite it instead of refusing.
-func runFileOwnerServing(client *http.Client, host string, info *runfile.Info) bool {
-	if info == nil || info.Port <= 0 {
+func runFileOwnerServing(client *http.Client, info *runfile.Info) bool {
+	if info == nil || (info.Port <= 0 && info.SocketPath == "") {
 		return false
 	}
 
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s:%d/healthz", host, info.Port), http.NoBody)
+	req, err := http.NewRequest(http.MethodGet, daemonendpoint.BaseURL(info)+"/healthz", http.NoBody)
 	if err != nil {
 		return false
 	}
-	resp, err := client.Do(req)
+	resp, err := daemonendpoint.Client(client, info.SocketPath).Do(req)
 	if err != nil {
 		return false
 	}

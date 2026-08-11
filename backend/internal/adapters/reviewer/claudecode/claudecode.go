@@ -8,6 +8,8 @@ package claudecode
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	workeragent "github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/claudecode"
@@ -103,7 +105,14 @@ func (r *Reviewer) PreLaunch(ctx context.Context, inv ports.ReviewInvocation) er
 	if hooks, ok := r.agent.(interface {
 		GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error
 	}); ok {
-		if err := hooks.GetAgentHooks(ctx, ports.WorkspaceHookConfig{WorkspacePath: inv.WorkspacePath}); err != nil {
+		executablePath, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("resolve AO executable for reviewer hooks: %w", err)
+		}
+		if err := hooks.GetAgentHooks(ctx, ports.WorkspaceHookConfig{
+			WorkspacePath:  inv.WorkspacePath,
+			ExecutablePath: executablePath,
+		}); err != nil {
 			return err
 		}
 	}

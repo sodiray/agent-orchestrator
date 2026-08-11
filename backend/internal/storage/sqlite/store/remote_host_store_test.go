@@ -47,6 +47,46 @@ func TestRemoteHostRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpsertRemoteHostUpdatesAnExistingRegistration(t *testing.T) {
+	s := newTestStore(t)
+	createdAt := time.Date(2026, 8, 7, 1, 2, 3, 0, time.UTC)
+	initial := domain.RemoteHost{
+		HostID:             "lab-host",
+		Address:            "127.0.0.1:3001",
+		Label:              "Original",
+		OperatorState:      domain.RemoteHostStateStopped,
+		LastProbeAt:        createdAt,
+		LastProbeSucceeded: true,
+		CreatedAt:          createdAt,
+		UpdatedAt:          createdAt,
+	}
+	created, err := s.UpsertRemoteHost(context.Background(), initial)
+	if err != nil || !created {
+		t.Fatalf("initial upsert: created=%v err=%v", created, err)
+	}
+	updatedAt := createdAt.Add(time.Minute)
+	replacement := domain.RemoteHost{
+		HostID:         initial.HostID,
+		Address:        "127.0.0.1:3002",
+		Label:          "Replacement",
+		LastProbeAt:    updatedAt,
+		LastProbeError: "probe has not completed",
+		CreatedAt:      updatedAt,
+		UpdatedAt:      updatedAt,
+	}
+	created, err = s.UpsertRemoteHost(context.Background(), replacement)
+	if err != nil || created {
+		t.Fatalf("replacement upsert: created=%v err=%v", created, err)
+	}
+	got, found, err := s.GetRemoteHost(context.Background(), initial.HostID)
+	if err != nil || !found {
+		t.Fatalf("get replacement: found=%v err=%v", found, err)
+	}
+	if got.Address != replacement.Address || got.Label != replacement.Label || got.OperatorState != "" || got.LastProbeError != replacement.LastProbeError || !got.CreatedAt.Equal(createdAt) || !got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("replacement = %+v", got)
+	}
+}
+
 func TestRemoteSessionSnapshotsRoundTrip(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Date(2026, 8, 7, 1, 2, 3, 0, time.UTC)

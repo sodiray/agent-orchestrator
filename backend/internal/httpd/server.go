@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
@@ -17,13 +19,16 @@ import (
 )
 
 // Server is the daemon's HTTP server together with its lifecycle: bind the
-// loopback port, publish the running.json handshake, serve until the context
+// configured loopback port or Unix socket, publish the running.json handshake, serve until the context
 // is cancelled, then shut down gracefully and clean up the handshake file.
 type Server struct {
 	cfg    config.Config
 	log    *slog.Logger
 	http   *http.Server
 	listen net.Listener
+	// socketFile records the Unix socket node created by this server. It lets
+	// shutdown avoid unlinking a socket a successor created after a restart.
+	socketFile os.FileInfo
 
 	shutdownRequested chan struct{}
 	shutdownOnce      sync.Once
@@ -34,7 +39,7 @@ type Server struct {
 // caller owns the returned Server's lifecycle via Run. termMgr may be nil, in
 // which case the /mux terminal surface is not mounted.
 //
-// If the configured port is already held, it falls back to an OS-assigned
+// If the configured loopback port is already held, it falls back to an OS-assigned
 // ephemeral port rather than failing. A genuine peer AO daemon is ruled out
 // upstream (the running.json + /healthz check in daemon.Run), so a conflict here
 // means a non-AO process owns the port; exiting would only leave the desktop
@@ -43,25 +48,16 @@ type Server struct {
 // reads, so the fallback propagates to the renderer with no UI changes.
 func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager, deps APIDeps) (*Server, error) {
 	log = loggerOrDefault(log)
-	ln, err := net.Listen("tcp", cfg.Addr())
+	ln, socketFile, err := listen(cfg, log)
 	if err != nil {
-		if !isAddrInUse(err) {
-			return nil, fmt.Errorf("bind %s: %w", cfg.Addr(), err)
-		}
-		// Configured port is taken by a non-AO process: retry on an ephemeral port.
-		fallback, ferr := net.Listen("tcp", net.JoinHostPort(cfg.Host, "0"))
-		if ferr != nil {
-			return nil, fmt.Errorf("bind %s (in use) and ephemeral fallback: %w", cfg.Addr(), ferr)
-		}
-		log.Warn("configured port in use; bound an ephemeral port instead",
-			"configured", cfg.Addr(), "bound", fallback.Addr().String())
-		ln = fallback
+		return nil, err
 	}
 
 	srv := &Server{
 		cfg:               cfg,
 		log:               log,
 		listen:            ln,
+		socketFile:        socketFile,
 		shutdownRequested: make(chan struct{}),
 	}
 	srv.http = &http.Server{
@@ -73,6 +69,95 @@ func NewWithDeps(cfg config.Config, log *slog.Logger, termMgr *terminal.Manager,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return srv, nil
+}
+
+func listen(cfg config.Config, log *slog.Logger) (net.Listener, os.FileInfo, error) {
+	if cfg.UsesUnixSocket() {
+		ln, socketFile, err := listenUnix(cfg.UnixSocketPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		return ln, socketFile, nil
+	}
+	if !isLoopbackTCPHost(cfg.Host) {
+		return nil, nil, fmt.Errorf("refusing non-loopback TCP host %q", cfg.Host)
+	}
+	ln, err := net.Listen("tcp", cfg.Addr())
+	if err == nil {
+		return ln, nil, nil
+	}
+	if !isAddrInUse(err) {
+		return nil, nil, fmt.Errorf("bind %s: %w", cfg.Addr(), err)
+	}
+	// Configured port is taken by a non-AO process: retry on an ephemeral port.
+	fallback, ferr := net.Listen("tcp", net.JoinHostPort(cfg.Host, "0"))
+	if ferr != nil {
+		return nil, nil, fmt.Errorf("bind %s (in use) and ephemeral fallback: %w", cfg.Addr(), ferr)
+	}
+	log.Warn("configured port in use; bound an ephemeral port instead",
+		"configured", cfg.Addr(), "bound", fallback.Addr().String())
+	return fallback, nil, nil
+}
+
+func isLoopbackTCPHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func listenUnix(path string) (net.Listener, os.FileInfo, error) {
+	if path == "" {
+		return nil, nil, fmt.Errorf("bind unix socket: path is required")
+	}
+	if !filepath.IsAbs(path) {
+		return nil, nil, fmt.Errorf("bind unix socket %q: path must be absolute", path)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create unix socket directory: %w", err)
+	}
+	if err := removeStaleUnixSocket(path); err != nil {
+		return nil, nil, err
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind unix socket %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(path)
+		return nil, nil, fmt.Errorf("restrict unix socket permissions: %w", err)
+	}
+	file, err := os.Lstat(path)
+	if err != nil {
+		_ = ln.Close()
+		_ = os.Remove(path)
+		return nil, nil, fmt.Errorf("inspect unix socket: %w", err)
+	}
+	return ln, file, nil
+}
+
+func removeStaleUnixSocket(path string) error {
+	file, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect unix socket %s: %w", path, err)
+	}
+	if file.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to replace %s: existing path is not a unix socket", path)
+	}
+	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		return fmt.Errorf("refusing to replace unix socket %s: a listener is accepting connections", path)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("refusing to replace unix socket %s: cannot prove it is stale: %w", path, err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove stale unix socket %s: %w", path, err)
+	}
+	return nil
 }
 
 // Addr returns the actual bound address (useful when the configured port was 0
@@ -92,6 +177,7 @@ func (s *Server) Run(ctx context.Context) error {
 	info := runfile.Info{
 		PID:                   os.Getpid(),
 		Port:                  s.boundPort(),
+		SocketPath:            s.boundSocketPath(),
 		StartedAt:             time.Now().UTC(),
 		Owner:                 os.Getenv("AO_OWNER"),
 		BrowserRuntimeToken:   os.Getenv("AO_BROWSER_RUNTIME_TOKEN"),
@@ -99,9 +185,13 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	if err := runfile.Write(s.cfg.RunFilePath, info); err != nil {
 		_ = s.listen.Close()
+		_ = s.removeSocketIfOwned()
 		return fmt.Errorf("write run-file: %w", err)
 	}
 	defer func() {
+		if err := s.removeSocketIfOwned(); err != nil {
+			s.log.Warn("failed to remove unix socket", "path", s.boundSocketPath(), "err", err)
+		}
 		if err := runfile.RemoveIfOwned(s.cfg.RunFilePath, info.PID); err != nil {
 			s.log.Warn("failed to remove run-file", "path", s.cfg.RunFilePath, "err", err)
 		}
@@ -147,7 +237,31 @@ func (s *Server) boundPort() int {
 	if tcp, ok := s.listen.Addr().(*net.TCPAddr); ok {
 		return tcp.Port
 	}
-	return s.cfg.Port
+	return 0
+}
+
+func (s *Server) boundSocketPath() string {
+	if !s.cfg.UsesUnixSocket() {
+		return ""
+	}
+	return s.cfg.UnixSocketPath
+}
+
+func (s *Server) removeSocketIfOwned() error {
+	if s.socketFile == nil || s.boundSocketPath() == "" {
+		return nil
+	}
+	current, err := os.Lstat(s.boundSocketPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(s.socketFile, current) {
+		return nil
+	}
+	return os.Remove(s.boundSocketPath())
 }
 
 func (s *Server) requestShutdown() {

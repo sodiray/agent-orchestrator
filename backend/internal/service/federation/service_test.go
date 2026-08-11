@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
+	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
 
@@ -17,6 +19,12 @@ type fakeLocalSessions struct{ sessions []domain.Session }
 
 func (f fakeLocalSessions) List(context.Context, sessionsvc.ListFilter) ([]domain.Session, error) {
 	return f.sessions, nil
+}
+
+type fakeLocalProjects struct{ projects []projectsvc.Summary }
+
+func (f fakeLocalProjects) List(context.Context) ([]projectsvc.Summary, error) {
+	return f.projects, nil
 }
 
 type fakeLocalNotifications struct {
@@ -87,6 +95,14 @@ type fakeClient struct {
 	list func(context.Context, string, ports.RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error)
 }
 
+type fakeProjectClient struct {
+	list func(context.Context, string) ([]ports.RemoteProjectSummary, error)
+}
+
+func (f fakeProjectClient) ListProjects(ctx context.Context, address string) ([]ports.RemoteProjectSummary, error) {
+	return f.list(ctx, address)
+}
+
 func (f fakeClient) ListSessions(ctx context.Context, address string, filter ports.RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error) {
 	return f.list(ctx, address, filter)
 }
@@ -97,6 +113,110 @@ func testLocalSession() domain.Session {
 
 func testRemoteView(id string) []byte {
 	return []byte(`{"id":"` + id + `","projectId":"remote","kind":"worker","status":"idle","prs":[]}`)
+}
+
+func TestListProjectsWithoutRemoteHostsIsLocalOnlyWithoutRegistryRead(t *testing.T) {
+	store := &fakeStore{}
+	svc := New(Deps{
+		Projects: fakeLocalProjects{projects: []projectsvc.Summary{{ID: "local", Name: "Local", Path: "/local"}}},
+		Store:    store,
+		Presence: fakePresence{},
+	})
+	projects, err := svc.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "local" || len(projects[0].Sources) != 0 {
+		t.Fatalf("projects = %#v", projects)
+	}
+	if store.listHostsCalls != 0 {
+		t.Fatalf("ListRemoteHosts calls = %d, want 0", store.listHostsCalls)
+	}
+}
+
+func TestListProjectsMergesLocalAndRemoteProjectsByID(t *testing.T) {
+	hosts := []domain.RemoteHost{
+		{HostID: "alpha-host", Address: "alpha:3001"},
+		{HostID: "beta-host", Address: "beta:3001"},
+	}
+	store := &fakeStore{hosts: hosts, snapshots: map[domain.RemoteHostID][]domain.RemoteSessionSnapshot{}}
+	svc := New(Deps{
+		Projects: fakeLocalProjects{projects: []projectsvc.Summary{{
+			ID: "mission", Name: "Mission local", Path: "/local/mission", Kind: domain.ProjectKindSingleRepo, OrchestratorAgent: "codex",
+		}}},
+		Store:    store,
+		Presence: fakePresence{hasHosts: true},
+		ProjectClient: fakeProjectClient{list: func(_ context.Context, address string) ([]ports.RemoteProjectSummary, error) {
+			if address == "alpha:3001" {
+				return []ports.RemoteProjectSummary{{ID: "mission", Name: "Mission alpha", Path: "/alpha/mission", Kind: domain.ProjectKindWorkspace, OrchestratorAgent: "claude-code"}}, nil
+			}
+			return []ports.RemoteProjectSummary{{ID: "mission", Name: "Mission beta", Path: "/beta/mission", Kind: domain.ProjectKindSingleRepo, OrchestratorAgent: "codex"}}, nil
+		}},
+	})
+	projects, err := svc.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("projects = %#v", projects)
+	}
+	project := projects[0]
+	if project.ID != "mission" || project.Name != "Mission local" || project.Path != "/local/mission" || project.Kind != domain.ProjectKindSingleRepo {
+		t.Fatalf("deterministic local winner = %#v", project)
+	}
+	if got := project.Sources; len(got) != 3 || got[0].HostID != "" || got[1].HostID != "alpha-host" || got[2].HostID != "beta-host" {
+		t.Fatalf("sources = %#v", got)
+	}
+	if want := []string{"name", "path", "kind", "orchestratorAgent"}; !reflect.DeepEqual(project.MetadataConflicts, want) {
+		t.Fatalf("metadata conflicts = %#v, want %#v", project.MetadataConflicts, want)
+	}
+}
+
+func TestListProjectsUsesSnapshotProjectForUnreachableHost(t *testing.T) {
+	host := domain.RemoteHost{HostID: "offline-host", Address: "offline:3001"}
+	store := &fakeStore{hosts: []domain.RemoteHost{host}, snapshots: map[domain.RemoteHostID][]domain.RemoteSessionSnapshot{
+		host.HostID: {{HostID: host.HostID, SessionID: "mission-7", View: testRemoteView("mission-7")}},
+	}}
+	svc := New(Deps{
+		Projects: fakeLocalProjects{}, Store: store, Presence: fakePresence{hasHosts: true},
+		ProjectClient: fakeProjectClient{list: func(context.Context, string) ([]ports.RemoteProjectSummary, error) {
+			return nil, errors.New("connection refused")
+		}},
+	})
+	projects, err := svc.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "remote" || len(projects[0].Sources) != 1 || projects[0].Sources[0].Available || projects[0].Sources[0].UnavailableReason != "remote daemon is not listening (connection refused)" {
+		t.Fatalf("projects = %#v", projects)
+	}
+}
+
+func TestListProjectsUsesPerHostTimeoutWithoutBlockingReachableHosts(t *testing.T) {
+	slow := domain.RemoteHost{HostID: "slow-host", Address: "slow:3001"}
+	live := domain.RemoteHost{HostID: "live-host", Address: "live:3001"}
+	store := &fakeStore{hosts: []domain.RemoteHost{slow, live}, snapshots: map[domain.RemoteHostID][]domain.RemoteSessionSnapshot{}}
+	svc := New(Deps{
+		Projects: fakeLocalProjects{}, Store: store, Presence: fakePresence{hasHosts: true}, Timeout: 20 * time.Millisecond,
+		ProjectClient: fakeProjectClient{list: func(ctx context.Context, address string) ([]ports.RemoteProjectSummary, error) {
+			if address == slow.Address {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return []ports.RemoteProjectSummary{{ID: "mission", Name: "Mission", Kind: domain.ProjectKindSingleRepo}}, nil
+		}},
+	})
+	started := time.Now()
+	projects, err := svc.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("ListProjects() took %s", elapsed)
+	}
+	if len(projects) != 1 || projects[0].ID != "mission" {
+		t.Fatalf("projects = %#v", projects)
+	}
 }
 
 func TestListWithoutRemoteHostsIsLocalOnlyWithoutRegistryRead(t *testing.T) {
@@ -162,7 +282,30 @@ func TestListUsesSnapshotsWhenRemoteHostIsUnreachable(t *testing.T) {
 		t.Fatalf("List() error = %v", err)
 	}
 	remote := sessions[1].Remote
-	if remote == nil || remote.Available || remote.UnavailableReason != "connection refused" {
+	if remote == nil || remote.Available || remote.UnavailableReason != "remote daemon is not listening (connection refused)" {
+		t.Fatalf("remote = %#v", remote)
+	}
+}
+
+func TestListUsesTimeoutReasonForUnreachableHost(t *testing.T) {
+	host := domain.RemoteHost{HostID: "workstation", Address: "127.0.0.1:3001"}
+	store := &fakeStore{hosts: []domain.RemoteHost{host}, snapshots: map[domain.RemoteHostID][]domain.RemoteSessionSnapshot{
+		host.HostID: {{HostID: host.HostID, SessionID: "remote-7", View: testRemoteView("remote-7")}},
+	}}
+	svc := New(Deps{
+		Local:    fakeLocalSessions{sessions: []domain.Session{testLocalSession()}},
+		Store:    store,
+		Presence: fakePresence{hasHosts: true},
+		Client: fakeClient{list: func(context.Context, string, ports.RemoteSessionListFilter) ([]domain.RemoteSessionSnapshot, error) {
+			return nil, context.DeadlineExceeded
+		}},
+	})
+	sessions, err := svc.List(context.Background(), sessionsvc.ListFilter{})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	remote := sessions[1].Remote
+	if remote == nil || remote.Available || remote.UnavailableReason != "remote host did not respond before the timeout" {
 		t.Fatalf("remote = %#v", remote)
 	}
 }

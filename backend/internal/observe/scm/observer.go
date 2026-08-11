@@ -485,7 +485,7 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 			continue
 		}
 		branch := strings.TrimSpace(sess.Metadata.Branch)
-		if branch == "" {
+		if branch == "" || domain.IsProjectRootWorkspaceBranch(branch) {
 			continue
 		}
 		proj, ok := projects[sess.ProjectID]

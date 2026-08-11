@@ -55,4 +55,7 @@ type ActivitySignal struct {
 	// public hook endpoint): lifecycle rejects it after a mode handoff or Chat
 	// controller replacement.
 	ControllerGeneration string
+	// Prompt is the user's message body, sent only with a user-prompt-submit
+	// hook. It is what AutoTitle names a session from.
+	Prompt string
 }

@@ -98,6 +98,7 @@ vi.mock("../hooks/useCommandPaletteEnabled", () => ({
 
 vi.mock("../hooks/useWorkspaceQuery", () => ({
 	useWorkspaceQuery: () => ({ data: ctx.workspaces }),
+	useRemoteHostsQuery: () => ({ data: [] }),
 	workspaceQueryKey: ["workspaces"],
 }));
 

@@ -111,6 +111,39 @@ describe("TaskComposer", () => {
 		expect(onCreated).toHaveBeenCalledWith("sess-empty");
 	});
 
+	it("sends an explicit available remote target with a task", async () => {
+		const user = userEvent.setup();
+		h.post.mockResolvedValueOnce({ data: { workerId: "builder~sess-1" } });
+		render(
+			<Wrap>
+				<TaskComposer projectId="proj-1" onCreated={vi.fn()} remoteHosts={[{ id: "builder", label: "Builder", state: "available" }]} />
+			</Wrap>,
+		);
+
+		await user.click(screen.getByRole("combobox", { name: "Run on" }));
+		await user.click(await screen.findByRole("option", { name: "Builder · Available" }));
+		fireEvent.click(screen.getByText("Start task"));
+
+		await waitFor(() =>
+			expect(h.post).toHaveBeenCalledWith(
+				"/api/v1/orchestrators/delegate",
+				expect.objectContaining({ body: expect.objectContaining({ targetHostId: "builder" }) }),
+			),
+		);
+	});
+
+	it("does not allow an unavailable remote target to start work", async () => {
+		const user = userEvent.setup();
+		render(
+			<Wrap>
+				<TaskComposer projectId="proj-1" onCreated={vi.fn()} remoteHosts={[{ id: "builder", label: "Builder", state: "unreachable", reason: "not listening" }]} />
+			</Wrap>,
+		);
+
+		await user.click(screen.getByRole("combobox", { name: "Run on" }));
+		expect(await screen.findByRole("option", { name: "Builder · Unreachable" })).toHaveAttribute("data-disabled");
+	});
+
 	it("keeps prompt guidance in the field instead of adding a separate footer row", () => {
 		render(
 			<Wrap>

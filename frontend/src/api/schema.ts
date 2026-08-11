@@ -1822,6 +1822,7 @@ export interface components {
             mode?: "tui" | "chat";
             model?: string;
             projectId: string;
+            targetHostId?: string;
         };
         DelegateTaskResponse: {
             ok: boolean;
@@ -1913,6 +1914,9 @@ export interface components {
         };
         ListProjectsResponse: {
             projects: components["schemas"]["ProjectSummary"][];
+            remoteHostInventoryError?: string;
+            remoteHostInventoryStale?: boolean;
+            remoteHosts?: components["schemas"]["RemoteHost"][];
         };
         ListRemoteHostsResponse: {
             remoteHosts: components["schemas"]["RemoteHost"][];
@@ -2063,11 +2067,14 @@ export interface components {
             agentConfig?: components["schemas"]["AgentConfig"];
             agentRules?: string;
             agentRulesFile?: string;
+            autoTitle?: boolean;
+            concurrentProjectRoot?: boolean;
             containerReap?: components["schemas"]["ContainerReapConfig"];
             defaultBranch?: string;
             env?: {
                 [key: string]: string;
             };
+            envFile?: string;
             orchestrator?: components["schemas"]["RoleOverride"];
             orchestratorRules?: string;
             postCreate?: string[];
@@ -2086,15 +2093,25 @@ export interface components {
         ProjectResponse: {
             project: components["schemas"]["Project"];
         };
+        ProjectSource: {
+            available: boolean;
+            hostId?: string;
+            kind: string;
+            name: string;
+            path: string;
+            unavailableReason?: string;
+        };
         ProjectSummary: {
             id: string;
             /** @enum {string} */
             kind: "single_repo" | "workspace" | "scratch";
+            metadataConflicts?: string[];
             name: string;
             orchestratorAgent?: string;
             path: string;
             resolveError?: string;
             sessionPrefix: string;
+            sources?: components["schemas"]["ProjectSource"][];
         };
         PushDeviceEnvelope: {
             device: components["schemas"]["PushDeviceResponse"];
@@ -2132,6 +2149,8 @@ export interface components {
             /** Format: date-time */
             createdAt: string;
             hostId: string;
+            inventoryError?: string;
+            inventoryStale?: boolean;
             label?: string;
             /** Format: date-time */
             lastProbeAt: string;
@@ -2399,6 +2418,8 @@ export interface components {
             event?: string;
             /** @description AO process generation that produced the signal. */
             launchId?: string;
+            /** @description User message body, sent with user-prompt-submit so a session can name itself from its first prompt. */
+            prompt?: string;
             /**
              * @description Agent activity state reported by an agent hook. Optional for metadata-only hooks.
              * @enum {string}
@@ -2502,6 +2523,9 @@ export interface components {
             mode?: "chat" | "tui";
             projectId: string;
             prompt?: string;
+            targetHostId?: string;
+            /** @enum {string} */
+            workspaceMode?: "isolated" | "project-root";
         };
         SpawnSessionResponse: {
             promptBytes: number;

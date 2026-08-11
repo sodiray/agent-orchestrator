@@ -16,7 +16,13 @@ vi.mock("../lib/api-client", () => ({
 
 vi.mock("../lib/telemetry", () => ({ captureRendererEvent: captureRendererEventMock }));
 
-import { useWorkspaceQuery } from "./useWorkspaceQuery";
+import { useRemoteHostsQuery, useWorkspaceQuery } from "./useWorkspaceQuery";
+
+type WorkspaceResponsePayload = {
+	projects?: { data?: unknown; error?: unknown };
+	sessions?: { data?: unknown; error?: unknown };
+	remoteHosts?: { data?: unknown; error?: unknown };
+};
 
 function wrapper({ children }: { children: ReactNode }) {
 	// The hook pins its own retry policy; retryDelay 0 keeps the error tests fast.
@@ -24,15 +30,22 @@ function wrapper({ children }: { children: ReactNode }) {
 	return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
 }
 
-function respondWith(payload: {
-	projects?: { data?: unknown; error?: unknown };
-	sessions?: { data?: unknown; error?: unknown };
-	remoteHosts?: { data?: unknown; error?: unknown };
-}) {
+function respondWith(payload: WorkspaceResponsePayload | (() => WorkspaceResponsePayload)) {
 	getMock.mockImplementation(async (url: string) => {
-		if (url === "/api/v1/projects") return payload.projects ?? { data: { projects: [] }, error: undefined };
-		if (url === "/api/v1/sessions") return payload.sessions ?? { data: { sessions: [] }, error: undefined };
-		if (url === "/api/v1/remote-hosts") return payload.remoteHosts ?? { data: { remoteHosts: [] }, error: undefined };
+		const currentPayload = typeof payload === "function" ? payload() : payload;
+		if (url === "/api/v1/projects") {
+			const projects = currentPayload.projects ?? { data: { projects: [] }, error: undefined };
+			const remoteHosts = (currentPayload.remoteHosts?.data as { remoteHosts?: unknown[] } | undefined)?.remoteHosts;
+			return {
+				...projects,
+				data:
+					projects.data && typeof projects.data === "object"
+						? { ...projects.data, ...(remoteHosts ? { remoteHosts } : {}) }
+						: projects.data,
+			};
+		}
+		if (url === "/api/v1/sessions") return currentPayload.sessions ?? { data: { sessions: [] }, error: undefined };
+		if (url === "/api/v1/remote-hosts") return currentPayload.remoteHosts ?? { data: { remoteHosts: [] }, error: undefined };
 		throw new Error(`unexpected GET ${url}`);
 	});
 }
@@ -160,11 +173,109 @@ describe("useWorkspaceQuery", () => {
 			},
 		});
 
-		const { result } = renderHook(() => useWorkspaceQuery(), { wrapper });
-		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		const { result } = renderHook(
+			() => ({ workspaceQuery: useWorkspaceQuery(), remoteHostsQuery: useRemoteHostsQuery() }),
+			{ wrapper },
+		);
+		await waitFor(() => expect(result.current.workspaceQuery.isSuccess).toBe(true));
 
 		expect(getMock).toHaveBeenCalledTimes(2);
 		expect(getMock).not.toHaveBeenCalledWith("/api/v1/remote-hosts");
+		expect(result.current.remoteHostsQuery.data).toEqual([]);
+	});
+
+	it("surfaces hosts that appear after a host-less first response", async () => {
+		let payload: WorkspaceResponsePayload = {
+			projects: { data: { projects: [{ id: "proj-1", name: "my-app", path: "/p" }], remoteHosts: [] }, error: undefined },
+			sessions: {
+				data: {
+					sessions: [
+						{ id: "sess-1", projectId: "proj-1", status: "working", isTerminated: false, updatedAt: "2026-08-08T10:00:00Z" },
+					],
+				},
+				error: undefined,
+			},
+		};
+		respondWith(() => payload);
+
+		const { result } = renderHook(
+			() => ({ workspaceQuery: useWorkspaceQuery(), remoteHostsQuery: useRemoteHostsQuery() }),
+			{ wrapper },
+		);
+		await waitFor(() => expect(result.current.workspaceQuery.isSuccess).toBe(true));
+		const firstWorkspaces = result.current.workspaceQuery.data;
+		expect(result.current.remoteHostsQuery.data).toEqual([]);
+
+		payload = {
+			...payload,
+			projects: {
+				data: {
+					projects: [{ id: "proj-1", name: "my-app", path: "/p" }],
+					remoteHosts: [{ hostId: "build-host", label: "Build host", state: "available" }],
+				},
+				error: undefined,
+			},
+		};
+		await result.current.remoteHostsQuery.refetch();
+
+		expect(result.current.workspaceQuery.data).toBe(firstWorkspaces);
+		await waitFor(() =>
+			expect(result.current.remoteHostsQuery.data).toEqual([
+				{ id: "build-host", label: "Build host", state: "available", reason: undefined },
+			]),
+		);
+	});
+
+	it("updates host state when a refetch leaves workspaces structurally equal", async () => {
+		let payload: WorkspaceResponsePayload = {
+			projects: {
+				data: {
+					projects: [{ id: "proj-1", name: "my-app", path: "/p" }],
+					remoteHosts: [{ hostId: "build-host", label: "Build host", state: "unreachable", lastProbeError: "not ready" }],
+				},
+				error: undefined,
+			},
+			sessions: {
+				data: {
+					sessions: [
+						{ id: "sess-1", projectId: "proj-1", status: "working", isTerminated: false, updatedAt: "2026-08-08T10:00:00Z" },
+					],
+				},
+				error: undefined,
+			},
+		};
+		respondWith(() => payload);
+
+		const { result } = renderHook(
+			() => ({ workspaceQuery: useWorkspaceQuery(), remoteHostsQuery: useRemoteHostsQuery() }),
+			{ wrapper },
+		);
+		await waitFor(() => expect(result.current.workspaceQuery.isSuccess).toBe(true));
+		const firstWorkspaces = result.current.workspaceQuery.data;
+		await waitFor(() =>
+			expect(result.current.remoteHostsQuery.data).toEqual([
+				{ id: "build-host", label: "Build host", state: "unreachable", reason: "not ready" },
+			]),
+		);
+
+		payload = {
+			...payload,
+			projects: {
+				data: {
+					projects: [{ id: "proj-1", name: "my-app", path: "/p" }],
+					remoteHosts: [{ hostId: "build-host", label: "Build host", state: "available" }],
+				},
+				error: undefined,
+			},
+		};
+		await result.current.remoteHostsQuery.refetch();
+
+		expect(result.current.workspaceQuery.data).toBe(firstWorkspaces);
+		await waitFor(() =>
+			expect(result.current.remoteHostsQuery.data).toEqual([
+				{ id: "build-host", label: "Build host", state: "available", reason: undefined },
+			]),
+		);
 	});
 
 	it("maps remote host labels and unavailable session state", async () => {
@@ -198,11 +309,15 @@ describe("useWorkspaceQuery", () => {
 			},
 		});
 
-		const { result } = renderHook(() => useWorkspaceQuery(), { wrapper });
-		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		const { result } = renderHook(
+			() => ({ workspaceQuery: useWorkspaceQuery(), remoteHostsQuery: useRemoteHostsQuery() }),
+			{ wrapper },
+		);
+		await waitFor(() => expect(result.current.workspaceQuery.isSuccess).toBe(true));
 
-		expect(getMock).toHaveBeenCalledWith("/api/v1/remote-hosts");
-		expect(result.current.data?.[0].sessions[0]).toMatchObject({
+		expect(getMock).toHaveBeenCalledTimes(2);
+		expect(getMock).not.toHaveBeenCalledWith("/api/v1/remote-hosts");
+		expect(result.current.workspaceQuery.data?.[0].sessions[0]).toMatchObject({
 			hostId: "build-host",
 			terminalHandleId: "build-host~term-1",
 			hostLabel: "Build machine",
@@ -210,6 +325,84 @@ describe("useWorkspaceQuery", () => {
 			availability: "unavailable",
 			unavailableReason: "Host is stopped for maintenance",
 		});
+		expect(result.current.remoteHostsQuery.data).toEqual([
+			{ id: "build-host", label: "Build machine", state: "stopped", reason: undefined },
+		]);
+	});
+
+	it("places a remote-only project and its qualified session in a renderable workspace", async () => {
+		respondWith({
+			projects: {
+				data: {
+					projects: [{ id: "mission", name: "Mission", path: "/workspace/mission", metadataConflicts: ["path"] }],
+				},
+				error: undefined,
+			},
+			sessions: {
+				data: {
+					sessions: [
+						{
+							id: "build-host~mission-7",
+							hostId: "build-host",
+							projectId: "mission",
+							displayName: "remote task",
+							status: "working",
+							isTerminated: false,
+							updatedAt: "2026-08-08T10:00:00Z",
+						},
+					],
+				},
+				error: undefined,
+			},
+			remoteHosts: {
+				data: { remoteHosts: [{ hostId: "build-host", label: "Build host", state: "available" }] },
+				error: undefined,
+			},
+		});
+
+		const { result } = renderHook(() => useWorkspaceQuery(), { wrapper });
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+		expect(result.current.data).toHaveLength(1);
+		expect(result.current.data?.[0]).toMatchObject({ id: "mission", name: "Mission", metadataConflicts: ["path"] });
+		expect(result.current.data?.[0].sessions).toMatchObject([
+			{ id: "build-host~mission-7", hostId: "build-host", hostLabel: "Build host", workspaceId: "mission" },
+		]);
+	});
+
+	it("merges local and multiple remote sessions into one project workspace", async () => {
+		respondWith({
+			projects: { data: { projects: [{ id: "mission", name: "Mission", path: "/workspace/mission" }] }, error: undefined },
+			sessions: {
+				data: {
+					sessions: [
+						{ id: "mission-1", projectId: "mission", status: "idle", isTerminated: false, updatedAt: "2026-08-08T10:00:00Z" },
+						{ id: "alpha-host~mission-1", hostId: "alpha-host", projectId: "mission", status: "working", isTerminated: false, updatedAt: "2026-08-08T10:00:00Z" },
+						{ id: "beta-host~mission-2", hostId: "beta-host", projectId: "mission", status: "working", isTerminated: false, updatedAt: "2026-08-08T10:00:00Z" },
+					],
+				},
+				error: undefined,
+			},
+			remoteHosts: {
+				data: {
+					remoteHosts: [
+						{ hostId: "alpha-host", label: "Alpha host", state: "available" },
+						{ hostId: "beta-host", label: "Beta host", state: "available" },
+					],
+				},
+				error: undefined,
+			},
+		});
+
+		const { result } = renderHook(() => useWorkspaceQuery(), { wrapper });
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+		expect(result.current.data).toHaveLength(1);
+		expect(result.current.data?.[0].sessions).toMatchObject([
+			{ id: "mission-1", hostId: undefined },
+			{ id: "alpha-host~mission-1", hostId: "alpha-host", hostLabel: "Alpha host" },
+			{ id: "beta-host~mission-2", hostId: "beta-host", hostLabel: "Beta host" },
+		]);
 	});
 
 	it("preserves scratch projects and leaves branchless scratch sessions branchless", async () => {

@@ -13,6 +13,7 @@ import {
 	toSessionActivity,
 	toSessionStatus,
 	type WorkspaceSummary,
+	type RemoteHostSummary,
 	type RemoteHostState,
 } from "../types/workspace";
 
@@ -32,6 +33,13 @@ function toPullRequestFacts(pr: components["schemas"]["SessionPRFacts"]): PullRe
 export const workspaceQueryKey = ["workspaces"] as const;
 const reportedUnknownSessionFields = new Set<string>();
 
+export type WorkspaceQueryData = {
+	workspaces: WorkspaceSummary[];
+	remoteHosts: RemoteHostSummary[];
+	remoteHostInventoryStale?: boolean;
+	remoteHostInventoryError?: string;
+};
+
 function reportUnknownSessionField(field: "status" | "activity", value?: string): void {
 	const reason = value ? "unrecognized" : "missing";
 	const key = `${field}:${reason}`;
@@ -47,13 +55,13 @@ function reportUnknownSessionField(field: "status" | "activity", value?: string)
 // and always hits the real daemon.
 type FakeAgentSeam = { snapshot: () => WorkspaceSummary[] };
 
-async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
+async function fetchWorkspaceData(): Promise<WorkspaceQueryData> {
 	if (usesPreviewWorkspaceData) {
 		const fake =
 			typeof window !== "undefined"
 				? (window as unknown as { __aoFakeAgent?: FakeAgentSeam }).__aoFakeAgent
 				: undefined;
-		return fake ? fake.snapshot() : mockWorkspaces;
+		return { workspaces: fake ? fake.snapshot() : mockWorkspaces, remoteHosts: [], remoteHostInventoryStale: false };
 	}
 	if (!hasTrustedApiBaseUrl()) {
 		throw new Error("AO daemon API is not ready");
@@ -64,22 +72,18 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 
 	if (projectsError || sessionsError) throw projectsError ?? sessionsError;
 	const sessions = sessionsData?.sessions ?? [];
-	const remoteHostIds = new Set(sessions.flatMap((session) => (session.hostId ? [session.hostId] : [])));
-	const remoteHosts =
-		remoteHostIds.size > 0
-			? await apiClient.GET("/api/v1/remote-hosts")
-			: { data: undefined, error: undefined };
 	const hostsById = new Map(
-		(remoteHosts.data?.remoteHosts ?? []).map((host) => [host.hostId, host] as const),
+		(projectsData?.remoteHosts ?? []).map((host) => [host.hostId, host] as const),
 	);
 
-	return (projectsData?.projects ?? []).map((project) => {
+	const workspaces: WorkspaceSummary[] = (projectsData?.projects ?? []).map((project) => {
 		const kind = toProjectKind(project.kind);
 		return {
 			id: project.id,
 			name: project.name,
 			kind,
 			path: project.path,
+			metadataConflicts: project.metadataConflicts,
 			orchestratorAgent: project.orchestratorAgent ? toAgentProvider(project.orchestratorAgent) : undefined,
 			sessions: sessions
 				.filter((session) => session.projectId === project.id)
@@ -128,6 +132,18 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 				}),
 		};
 	});
+	return {
+		workspaces,
+		remoteHosts: (projectsData?.remoteHosts ?? []).map((host) => ({
+			id: host.hostId,
+			label: host.label?.trim() || host.hostId,
+			state: toRemoteHostState(host.state) ?? "unreachable",
+			reason: host.lastProbeError || undefined,
+			inventoryStale: host.inventoryStale || undefined,
+		})),
+		remoteHostInventoryStale: projectsData?.remoteHostInventoryStale ?? false,
+		remoteHostInventoryError: projectsData?.remoteHostInventoryError || undefined,
+	};
 }
 
 function toRemoteHostState(state?: string): RemoteHostState | undefined {
@@ -141,11 +157,22 @@ function toRemoteHostState(state?: string): RemoteHostState | undefined {
 // with the router's defaultPreload: "intent") and the hook reads the same cache.
 export const workspaceQueryOptions = {
 	queryKey: workspaceQueryKey,
-	queryFn: fetchWorkspaces,
+	queryFn: fetchWorkspaceData,
 	retry: 1,
 	refetchInterval: 15_000,
 };
 
 export function useWorkspaceQuery() {
-	return useQuery(workspaceQueryOptions);
+	return useQuery({ ...workspaceQueryOptions, select: (data) => data.workspaces });
+}
+
+export function useRemoteHostsQuery() {
+	return useQuery({ ...workspaceQueryOptions, select: (data) => data.remoteHosts });
+}
+
+export function useRemoteHostInventoryStatusQuery() {
+	return useQuery({
+		...workspaceQueryOptions,
+		select: (data) => ({ stale: data.remoteHostInventoryStale ?? false, reason: data.remoteHostInventoryError }),
+	});
 }

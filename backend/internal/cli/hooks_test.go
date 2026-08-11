@@ -811,7 +811,7 @@ func TestHooks_NoSessionIDIsNoOp(t *testing.T) {
 	srv, capture := activityServer(t, http.StatusOK, `{}`)
 	writeRunFileFor(t, cfg, srv)
 
-	_, _, err := executeCLI(t, Deps{
+	out, errOut, err := executeCLI(t, Deps{
 		In:           strings.NewReader(`{"notification_type":"idle_prompt"}`),
 		ProcessAlive: func(int) bool { return true },
 	}, "hooks", "claude-code", "notification")
@@ -820,6 +820,34 @@ func TestHooks_NoSessionIDIsNoOp(t *testing.T) {
 	}
 	if capture.hits != 0 {
 		t.Errorf("expected no daemon call for a non-AO session, got %d", capture.hits)
+	}
+	if out != "" || errOut != "" {
+		t.Errorf("non-AO hook output = stdout %q stderr %q, want both empty", out, errOut)
+	}
+}
+
+func TestHooks_UnknownSessionIsSilent(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "foreign-7")
+	cfg := setConfigEnv(t)
+	srv, capture := activityServer(t, http.StatusNotFound,
+		`{"error":"not_found","code":"SESSION_NOT_FOUND","message":"session not found"}`)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{
+		In:           strings.NewReader(`{"reason":"logout"}`),
+		ProcessAlive: func(int) bool { return true },
+	}, "hooks", "claude-code", "session-end")
+	if err != nil {
+		t.Fatalf("unknown-session hook must exit 0, got: %v", err)
+	}
+	if capture.hits != 1 {
+		t.Fatalf("unknown-session hook calls = %d, want 1", capture.hits)
+	}
+	if out != "" || errOut != "" {
+		t.Errorf("unknown-session hook output = stdout %q stderr %q, want both empty", out, errOut)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.dataDir, hooksLogName)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("unknown-session hook wrote hooks.log: %v", err)
 	}
 }
 

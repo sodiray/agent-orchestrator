@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObjec
 import { useTranslation } from "react-i18next";
 import { useCommandPaletteEnabled } from "../hooks/useCommandPaletteEnabled";
 import { useRestoreSession } from "../hooks/useRestoreSession";
-import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { useRemoteHostsQuery, useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { aoBridge } from "../lib/bridge";
 import {
 	buildCommands,
@@ -49,6 +49,7 @@ export function CommandPalette() {
 	const restoreSessionById = useRestoreSession();
 	const params = useParams({ strict: false }) as { projectId?: string; sessionId?: string };
 	const workspaces = useWorkspaceQuery().data ?? [];
+	const remoteHosts = useRemoteHostsQuery().data ?? [];
 	const { createProject, initializeProjectRepository } = useShell();
 	const resolvedTheme = useUiStore((s) => s.resolvedTheme);
 	const setThemePreference = useUiStore((s) => s.setThemePreference);
@@ -433,6 +434,7 @@ export function CommandPalette() {
 						)}
 						<TaskComposer
 							projectId={view.projectId}
+							remoteHosts={remoteHosts}
 							autoFocusTitle
 							onDirtyChange={onComposerDirtyChange}
 							onSubmittingChange={onComposerSubmittingChange}

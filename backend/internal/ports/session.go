@@ -20,7 +20,10 @@ type SpawnConfig struct {
 	Kind         domain.SessionKind
 	Harness      domain.AgentHarness
 	Branch       string
-	Prompt       string
+	// WorkspaceMode controls whether AO creates an isolated workspace or runs
+	// directly in the registered project's root.
+	WorkspaceMode domain.WorkspaceMode
+	Prompt        string
 	// AgentConfig overrides the resolved project/role agent config for this
 	// single spawn. Empty fields keep the project defaults.
 	AgentConfig AgentConfig

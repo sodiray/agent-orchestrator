@@ -26,7 +26,7 @@ func healthzBody(service string, pid int) http.HandlerFunc {
 	}
 }
 
-func hostPort(t *testing.T, rawURL string) (string, int) {
+func portFromURL(t *testing.T, rawURL string) int {
 	t.Helper()
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -36,7 +36,7 @@ func hostPort(t *testing.T, rawURL string) (string, int) {
 	if err != nil {
 		t.Fatalf("port from %q: %v", rawURL, err)
 	}
-	return u.Hostname(), port
+	return port
 }
 
 func TestRunFileOwnerServing(t *testing.T) {
@@ -82,9 +82,9 @@ func TestRunFileOwnerServing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
-			host, port := hostPort(t, srv.URL)
+			port := portFromURL(t, srv.URL)
 
-			got := runFileOwnerServing(srv.Client(), host, &runfile.Info{PID: pid, Port: port})
+			got := runFileOwnerServing(srv.Client(), &runfile.Info{PID: pid, Port: port})
 			if got != tc.want {
 				t.Errorf("runFileOwnerServing = %v, want %v", got, tc.want)
 			}
@@ -96,21 +96,21 @@ func TestRunFileOwnerServingNoListener(t *testing.T) {
 	// Bind then immediately close to obtain a port nothing is listening on, so
 	// the probe hits a refused connection — the leaked-run-file case.
 	srv := httptest.NewServer(http.NotFoundHandler())
-	host, port := hostPort(t, srv.URL)
+	port := portFromURL(t, srv.URL)
 	srv.Close()
 
 	client := &http.Client{Timeout: time.Second}
-	if runFileOwnerServing(client, host, &runfile.Info{PID: 4242, Port: port}) {
+	if runFileOwnerServing(client, &runfile.Info{PID: 4242, Port: port}) {
 		t.Error("runFileOwnerServing on a dead port = true, want false (stale, safe to overwrite)")
 	}
 }
 
 func TestRunFileOwnerServingNilOrZeroPort(t *testing.T) {
 	client := &http.Client{Timeout: time.Second}
-	if runFileOwnerServing(client, "127.0.0.1", nil) {
+	if runFileOwnerServing(client, nil) {
 		t.Error("runFileOwnerServing(nil) = true, want false")
 	}
-	if runFileOwnerServing(client, "127.0.0.1", &runfile.Info{PID: 1, Port: 0}) {
+	if runFileOwnerServing(client, &runfile.Info{PID: 1, Port: 0}) {
 		t.Error("runFileOwnerServing(port 0) = true, want false")
 	}
 }

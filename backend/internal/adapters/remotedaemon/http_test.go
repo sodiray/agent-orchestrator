@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemonmeta"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -54,6 +55,17 @@ func TestHTTPProberRefusesRemoteRedirect(t *testing.T) {
 	}
 }
 
+func TestHTTPProberHonorsConfiguredTimeout(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	err := NewHTTPProber(client, 10*time.Millisecond).Probe(context.Background(), "remote.example")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Probe() error = %v, want configured deadline exceeded", err)
+	}
+}
+
 func TestHTTPSessionListerReadsNativeSessionViews(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/sessions" {
@@ -77,6 +89,26 @@ func TestHTTPSessionListerReadsNativeSessionViews(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].SessionID != domain.SessionID("project-7") {
 		t.Fatalf("sessions = %#v", sessions)
+	}
+}
+
+func TestHTTPSessionListerReadsNativeProjects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/projects" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.Header.Get("X-AO-Federation-Local") != "1" {
+			t.Errorf("federation header = %q", r.Header.Get("X-AO-Federation-Local"))
+		}
+		_, _ = w.Write([]byte(`{"projects":[{"id":"mission","name":"Mission","path":"/workspace/mission","kind":"single_repo","sessionPrefix":"mis","orchestratorAgent":"codex"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	projects, err := NewHTTPSessionLister(nil, 0).ListProjects(context.Background(), strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "mission" || projects[0].Kind != domain.ProjectKindSingleRepo {
+		t.Fatalf("projects = %#v", projects)
 	}
 }
 

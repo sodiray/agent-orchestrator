@@ -18,7 +18,7 @@ import {
 	SIDEBAR_DEFAULT_WIDTH,
 	SIDEBAR_MIN_WIDTH,
 } from "./Sidebar";
-import type { WorkspaceSession, WorkspaceSummary } from "../types/workspace";
+import type { RemoteHostSummary, WorkspaceSession, WorkspaceSummary } from "../types/workspace";
 import { agentsQueryKey } from "../hooks/useAgentsQuery";
 import { useUiStore } from "../stores/ui-store";
 
@@ -125,6 +125,9 @@ function renderSidebar({
 	onRemoveProject = vi.fn().mockResolvedValue(undefined) as RemoveProjectHandler,
 	seedAgents = true,
 	workspaces = [workspace],
+	remoteHosts = [],
+	remoteHostInventoryStale = false,
+	remoteHostInventoryError,
 	initialOpen = true,
 }: {
 	onCreateProject?: CreateProjectHandler;
@@ -132,6 +135,9 @@ function renderSidebar({
 	onRemoveProject?: RemoveProjectHandler;
 	seedAgents?: boolean;
 	workspaces?: WorkspaceSummary[];
+	remoteHosts?: RemoteHostSummary[];
+	remoteHostInventoryStale?: boolean;
+	remoteHostInventoryError?: string;
 	initialOpen?: boolean;
 } = {}) {
 	const queryClient = new QueryClient({
@@ -161,12 +167,29 @@ function renderSidebar({
 					onInitializeProject={onInitializeProject}
 					onRemoveProject={onRemoveProject}
 					workspaces={workspaces}
+					remoteHosts={remoteHosts}
+					remoteHostInventoryStale={remoteHostInventoryStale}
+					remoteHostInventoryError={remoteHostInventoryError}
 				/>
 			</SidebarProvider>
 		</QueryClientProvider>,
 	);
 	return onRemoveProject;
 }
+
+it("shows registered hosts without a session and hides the section when none are registered", () => {
+	renderSidebar({ workspaces: [], remoteHosts: [{ id: "builder", label: "Builder", state: "unreachable", reason: "remote daemon is not listening" }] });
+	expect(screen.getByText("Hosts")).toBeInTheDocument();
+	expect(screen.getByTestId("remote-host-row")).toHaveTextContent("Builder");
+	expect(screen.getByTestId("remote-host-row")).toHaveTextContent("Unreachable");
+	expect(screen.getByText("remote daemon is not listening")).toBeInTheDocument();
+});
+
+it("shows an inventory failure when no host row can carry it", () => {
+	renderSidebar({ workspaces: [], remoteHostInventoryStale: true, remoteHostInventoryError: "inventory command timed out" });
+	expect(screen.getByText("Hosts")).toBeInTheDocument();
+	expect(screen.getByText("Inventory stale: inventory command timed out")).toBeInTheDocument();
+});
 
 /** Projects render collapsed; open one to list all of its sessions. */
 

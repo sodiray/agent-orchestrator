@@ -13,6 +13,8 @@ import (
 
 var _ remotehostsvc.Store = (*Store)(nil)
 
+// CreateRemoteHost inserts host only when its operator-chosen identity is not
+// already registered, reporting whether a new durable row was created.
 func (s *Store) CreateRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -33,6 +35,41 @@ ON CONFLICT (host_id) DO NOTHING`, host.HostID, host.Address, host.Label, host.O
 	return affected > 0, nil
 }
 
+// UpsertRemoteHost records a new host or refreshes its operator-supplied
+// details, reporting whether this call created the registry entry.
+func (s *Store) UpsertRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	result, err := s.writeDB.ExecContext(ctx, `
+INSERT INTO remote_hosts (
+    host_id, address, label, operator_state, last_probe_at, last_probe_succeeded,
+    last_probe_error, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (host_id) DO NOTHING`, host.HostID, host.Address, host.Label, host.OperatorState,
+		host.LastProbeAt, host.LastProbeSucceeded, host.LastProbeError, host.CreatedAt, host.UpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("insert remote host %s: %w", host.HostID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read insert remote host result %s: %w", host.HostID, err)
+	}
+	if affected > 0 {
+		return true, nil
+	}
+	if _, err := s.writeDB.ExecContext(ctx, `
+UPDATE remote_hosts
+SET address = ?, label = ?, operator_state = ?, last_probe_at = ?, last_probe_succeeded = ?,
+    last_probe_error = ?, updated_at = ?
+WHERE host_id = ?`, host.Address, host.Label, host.OperatorState, host.LastProbeAt,
+		host.LastProbeSucceeded, host.LastProbeError, host.UpdatedAt, host.HostID); err != nil {
+		return false, fmt.Errorf("update remote host %s: %w", host.HostID, err)
+	}
+	return false, nil
+}
+
+// ListRemoteHosts returns all durable registry rows in host identity order for
+// deterministic service and API views.
 func (s *Store) ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error) {
 	rows, err := s.readDB.QueryContext(ctx, `
 SELECT host_id, address, label, operator_state, last_probe_at, last_probe_succeeded,
@@ -56,6 +93,8 @@ FROM remote_hosts ORDER BY host_id`)
 	return hosts, nil
 }
 
+// GetRemoteHost loads one registry row and distinguishes a missing identity
+// from a storage error for callers that map the result to an API response.
 func (s *Store) GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error) {
 	row := s.readDB.QueryRowContext(ctx, `
 SELECT host_id, address, label, operator_state, last_probe_at, last_probe_succeeded,
@@ -71,6 +110,8 @@ FROM remote_hosts WHERE host_id = ?`, id)
 	return host, true, nil
 }
 
+// RecordRemoteHostProbe stores the latest reachability observation and reports
+// whether its host still existed when the asynchronous probe completed.
 func (s *Store) RecordRemoteHostProbe(ctx context.Context, id domain.RemoteHostID, at time.Time, succeeded bool, failureReason string) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -88,6 +129,8 @@ WHERE host_id = ?`, at, succeeded, failureReason, at, id)
 	return affected > 0, nil
 }
 
+// SetRemoteHostOperatorState persists an explicit stop, destroy, or resume
+// decision and returns the updated row when the host exists.
 func (s *Store) SetRemoteHostOperatorState(ctx context.Context, id domain.RemoteHostID, state domain.RemoteHostState, at time.Time) (domain.RemoteHost, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -107,6 +150,8 @@ RETURNING host_id, address, label, operator_state, last_probe_at, last_probe_suc
 	return host, true, nil
 }
 
+// DeleteRemoteHost removes a registry entry and reports whether there was a
+// matching host to deregister.
 func (s *Store) DeleteRemoteHost(ctx context.Context, id domain.RemoteHostID) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -121,6 +166,8 @@ func (s *Store) DeleteRemoteHost(ctx context.Context, id domain.RemoteHostID) (b
 	return affected > 0, nil
 }
 
+// ReplaceRemoteSessionSnapshots atomically replaces one owner's cached session
+// views after a successful probe so outage reads remain internally consistent.
 func (s *Store) ReplaceRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID, snapshots []domain.RemoteSessionSnapshot) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -145,6 +192,8 @@ VALUES (?, ?, ?, ?)`, id, snapshot.SessionID, string(snapshot.View), snapshot.Ob
 	return nil
 }
 
+// ListRemoteSessionSnapshots returns the last owner views retained for a host
+// so federation can show explicit unavailable sessions during an outage.
 func (s *Store) ListRemoteSessionSnapshots(ctx context.Context, id domain.RemoteHostID) ([]domain.RemoteSessionSnapshot, error) {
 	rows, err := s.readDB.QueryContext(ctx, `
 SELECT host_id, session_id, view_json, observed_at

@@ -40,7 +40,7 @@ import { SessionsBoard } from "../../components/SessionsBoard";
 import { ShellProvider, type ShellContextValue } from "../../lib/shell-context";
 import { useUiStore } from "../../stores/ui-store";
 
-type Project = { id: string; name: string; path: string; orchestratorAgent?: string };
+type Project = { id: string; name: string; path: string; orchestratorAgent?: string; metadataConflicts?: string[] };
 type Session = Record<string, unknown>;
 
 function respondWith(projects: Project[], sessions: Session[]) {
@@ -121,6 +121,31 @@ beforeEach(() => {
 });
 
 describe("global board first launch", () => {
+	it("renders a remote-only project session in its host-attributed board group", async () => {
+		respondWith(
+			[{ id: "mission", name: "Mission", path: "/workspace/mission", metadataConflicts: ["path"] }],
+			[
+				{
+					id: "build-host~mission-7",
+					hostId: "build-host",
+					projectId: "mission",
+					displayName: "remote task",
+					harness: "codex",
+					kind: "worker",
+					status: "working",
+					isTerminated: false,
+					updatedAt: "2026-08-08T10:00:00Z",
+					prs: [],
+				},
+			],
+		);
+		renderBoard(<SessionsBoard projectId="mission" />);
+
+		expect(await screen.findByText("remote task")).toBeInTheDocument();
+		expect(screen.getByRole("region", { name: "Host build-host" })).toBeInTheDocument();
+		expect(screen.getByRole("status")).toHaveTextContent("Project metadata differs across hosts (path)");
+	});
+
 	it("shows the startup loader instead of import while the daemon is booting", async () => {
 		respondWith([], []);
 		lastQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

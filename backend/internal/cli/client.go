@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemonendpoint"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 )
 
@@ -127,7 +128,7 @@ func (c *commandContext) doJSONPathWithHeaders(
 		}
 		reader = bytes.NewReader(payload)
 	}
-	url := fmt.Sprintf("http://%s:%d%s", config.LoopbackHost, info.Port, path)
+	url := daemonendpoint.BaseURL(info) + path
 	req, err := http.NewRequestWithContext(ctx, method, url, reader) // #nosec G704 -- daemon host is fixed loopback; path is an internal API route.
 	if err != nil {
 		return err
@@ -141,7 +142,7 @@ func (c *commandContext) doJSONPathWithHeaders(
 
 	// Reuse the injected client's transport (keeps it stubbable in tests) but
 	// give daemon API calls far more headroom than the 2s status-probe timeout.
-	client := *c.deps.HTTPClient
+	client := *daemonendpoint.Client(c.deps.HTTPClient, info.SocketPath)
 	client.Timeout = commandTimeout
 	resp, err := client.Do(req) // #nosec G704 -- request target is the fixed loopback daemon URL above.
 	if err != nil {

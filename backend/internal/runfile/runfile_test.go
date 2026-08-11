@@ -3,6 +3,7 @@ package runfile
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,6 +96,27 @@ func TestReadMissingIsNotError(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("Read missing = %+v, want nil", got)
+	}
+}
+
+func TestWriteUnixSocketInfoOmitsTCPPort(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "running.json")
+	if err := Write(path, Info{PID: 123, SocketPath: "/tmp/ao.sock", StartedAt: time.Unix(100, 0).UTC()}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read run-file: %v", err)
+	}
+	if strings.Contains(string(raw), `"port"`) {
+		t.Fatalf("unix socket run-file contains TCP port: %s", raw)
+	}
+	info, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if info == nil || info.SocketPath != "/tmp/ao.sock" || info.Port != 0 {
+		t.Fatalf("Info = %+v, want socket path and no port", info)
 	}
 }
 

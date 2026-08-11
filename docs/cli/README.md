@@ -132,18 +132,81 @@ PR actions are available through `ao pr merge` and
 
 ## Configuration
 
-The CLI and daemon share the same environment-driven config:
+The daemon first applies built-in defaults, then optionally reads
+`$AO_DATA_DIR/config.yaml` (default `~/.ao/data/config.yaml`), and finally
+applies environment variables. A present environment variable overrides the
+file value, including an empty variable that intentionally restores that
+setting's normal default behavior. A missing file preserves the environment-only behavior; an invalid
+or group/world-writable file stops startup. The file is trusted operator input,
+including its optional inventory command, and must not be writable by anyone
+other than its owner.
+
+`AO_DATA_DIR` remains environment-only because it locates the configuration
+file itself. `AO_APP_RUN_ID` and `AO_TELEMETRY_APP_VERSION` are supervisor
+launch metadata and are environment-only as well.
+
+The CLI and daemon share these environment settings:
 
 | Var                   | Default              | Purpose                                                                                        |
 | --------------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
-| `AO_PORT`             | `3001`               | Loopback daemon port.                                                                          |
-| `AO_RUN_FILE`         | `~/.ao/running.json` | PID/port handshake.                                                                            |
+| `AO_LISTEN`           | `loopback`           | Daemon listener: `loopback`, or `unix:<path>` for a Unix-domain socket.                       |
+| `AO_PORT`             | `3001`               | Loopback daemon port; ignored when `AO_LISTEN` selects a Unix socket.                          |
+| `AO_RUN_FILE`         | `~/.ao/running.json` | PID/listener handshake.                                                                        |
 | `AO_DATA_DIR`         | `~/.ao/data`         | SQLite data directory.                                                                         |
 | `AO_REQUEST_TIMEOUT`  | `60s`                | REST request timeout.                                                                          |
 | `AO_SHUTDOWN_TIMEOUT` | `10s`                | Graceful shutdown cap.                                                                         |
+| `AO_REMOTE_HOST_PROBE_TIMEOUT` | `10s`          | Per-host health probe and snapshot timeout.                                                    |
+| `AO_HOST_INVENTORY_COMMAND` | unset             | JSON argv array for the optional host inventory command.                                       |
+| `AO_HOST_INVENTORY_INTERVAL` | `30s`           | Host inventory refresh interval.                                                               |
+| `AO_HOST_INVENTORY_TIMEOUT` | `10s`            | Host inventory command timeout.                                                                |
+| `AO_HOST_INVENTORY_MAX_OUTPUT` | `1048576`      | Maximum inventory-command stdout bytes.                                                        |
+| `AO_AGENT`            | `claude-code`        | Compatibility agent adapter.                                                                   |
+| `AO_ALLOWED_ORIGINS`  | `app://renderer`     | Comma-separated CORS origins.                                                                  |
+| `AO_TELEMETRY_EVENTS` | `off`                | Local event capture.                                                                           |
+| `AO_TELEMETRY_METRICS` | `off`               | Local metric capture.                                                                          |
+| `AO_TELEMETRY_REMOTE` | `off`                | Remote telemetry exporter: `off` or `posthog`.                                                 |
+| `AO_TELEMETRY_POSTHOG_KEY` | unset           | Remote telemetry project key.                                                                  |
+| `AO_TELEMETRY_POSTHOG_HOST` | `https://us.i.posthog.com` | Remote telemetry ingestion host.                                             |
+| `AO_TELEMETRY_DISABLED_EVENTS` | unset        | Comma-separated telemetry event-stream kill switch.                                            |
 | `AO_KEEP_DAEMON`      | unset (off)          | Keep the desktop app's daemon running after the window closes; stop only via `ao stop`. (fork) |
 
-The daemon always binds `127.0.0.1`.
+The optional YAML file has this complete schema. All fields other than
+`version` are optional; durations use Go duration syntax. `hostInventory.command`
+is an argv vector, never a shell command string. An empty command array disables
+inventory. `listen` is `loopback` or `unix:<path>`; TCP hosts are never accepted.
+
+```yaml
+version: 1
+listen: loopback
+port: 3001
+requestTimeout: 60s
+shutdownTimeout: 10s
+remoteHostProbeTimeout: 10s
+hostInventory:
+  command: [inventory, list, --json]
+  interval: 30s
+  timeout: 10s
+  maxOutput: 1048576
+runFile: /absolute/path/to/running.json
+agent: claude-code
+allowedOrigins: [app://renderer]
+telemetry:
+  events: false
+  metrics: false
+  remote: off
+  postHogKey: ""
+  postHogHost: https://us.i.posthog.com
+  disabledEvents: []
+```
+
+The default daemon listener always binds `127.0.0.1`; no TCP host override is
+available because the daemon has no authentication, CORS boundary, or TLS for
+public traffic. `AO_LISTEN=unix:/absolute/path` instead selects a Unix-domain
+socket. A Unix socket is a stronger boundary than loopback TCP: it has no
+network reachability and access is controlled by filesystem permissions. The
+daemon creates a missing socket parent directory with mode `0700` and sets the
+socket file to mode `0600`. `running.json` records `socketPath` instead of a
+TCP port for this mode.
 
 ## Manual smoke test
 

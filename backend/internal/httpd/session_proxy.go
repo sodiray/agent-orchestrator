@@ -69,6 +69,9 @@ func newRemoteDaemonClient(timeout time.Duration) *http.Client {
 // IDs take the existing handler path without a host-registry read.
 func (p *sessionProxy) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p.forwardTargetedCreation(w, r) {
+			return
+		}
 		if qualified, ok := qualifiedNotificationFromPath(r.URL.Path); ok {
 			host, found, err := p.federation.Resolve(r.Context(), qualified.HostID)
 			if err != nil {
@@ -126,34 +129,124 @@ func (p *sessionProxy) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (p *sessionProxy) forwardNotification(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedNotificationID) {
+// forwardTargetedCreation resolves a host explicitly named in a creation body.
+// Creation has no session id yet, so unlike ordinary federation routes it
+// cannot route from a qualified path. The target field is consumed locally and
+// never reaches the owning daemon, where it would otherwise be ambiguous.
+func (p *sessionProxy) forwardTargetedCreation(w http.ResponseWriter, r *http.Request) bool {
+	if !isTargetedCreationRoute(r) {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Invalid JSON body", nil)
+		return true
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	rawTarget, hasTarget := payload["targetHostId"]
+	if !hasTarget {
+		return false
+	}
+	var targetHostID string
+	if err := json.Unmarshal(rawTarget, &targetHostID); err != nil {
+		return false
+	}
+	targetHostID = strings.TrimSpace(targetHostID)
+	if targetHostID == "" {
+		return false
+	}
+	hostID := domain.RemoteHostID(targetHostID)
+	if err := domain.ValidateRemoteHostID(hostID); err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "INVALID_REMOTE_HOST_ID", err.Error(), nil)
+		return true
+	}
+	host, found, err := p.federation.Resolve(r.Context(), hostID)
+	if err != nil {
+		p.log.Error("resolve remote creation host failed", "hostId", hostID, "err", err)
+		envelope.WriteAPIError(w, r, http.StatusInternalServerError, "internal", "REMOTE_HOST_RESOLUTION_FAILED",
+			"Could not resolve the remote host", map[string]any{"hostId": hostID})
+		return true
+	}
+	if !found {
+		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "REMOTE_HOST_NOT_FOUND",
+			fmt.Sprintf("Remote host %q is not registered", hostID), map[string]any{"hostId": hostID})
+		return true
+	}
+	if host.CurrentState() != domain.RemoteHostStateAvailable {
+		reason := remoteHostUnavailabilityReason(host)
+		envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "REMOTE_HOST_UNAVAILABLE",
+			fmt.Sprintf("Remote host %q is unavailable: %s", host.HostID, reason), map[string]any{"hostId": host.HostID, "reason": reason})
+		return true
+	}
+	delete(payload, "targetHostId")
+	remoteBody, err := json.Marshal(payload)
+	if err != nil {
+		envelope.WriteAPIError(w, r, http.StatusInternalServerError, "internal", "REMOTE_HOST_REQUEST_FAILED", "Could not prepare the remote request", nil)
+		return true
+	}
 	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
 	defer cancel()
+	target := &url.URL{Scheme: "http", Host: host.Address, Path: r.URL.Path, RawQuery: r.URL.RawQuery}
+	source, err := http.NewRequestWithContext(proxyCtx, r.Method, target.String(), bytes.NewReader(remoteBody)) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		p.writeRemoteUnavailable(w, r, host, "build remote creation proxy request", err)
+		return true
+	}
+	source.Header = r.Header
+	req, err := remoteProxyRequest(proxyCtx, source, target)
+	if err != nil {
+		p.writeRemoteUnavailable(w, r, host, "build remote creation proxy request", err)
+		return true
+	}
+	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
+	if err != nil {
+		p.writeRemoteRequestError(w, r, host, "remote creation proxy failed", err)
+		return true
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if isRedirect(resp.StatusCode) {
+		p.writeRemoteRedirect(w, r, host)
+		return true
+	}
+	if err := p.writeQualifiedResponse(w, resp, domain.QualifiedSessionID{HostID: host.HostID}); err != nil {
+		p.log.Warn("qualify remote creation response failed", "hostId", host.HostID, "reason", err.Error())
+		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
+			fmt.Sprintf("Remote host %q returned an unqualifiable creation response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+	}
+	return true
+}
+
+func isTargetedCreationRoute(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	return r.URL.Path == "/api/v1/sessions" || r.URL.Path == "/api/v1/orchestrators/delegate"
+}
+
+func remoteHostUnavailabilityReason(host domain.RemoteHost) string {
+	if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
+		return fmt.Sprintf("remote host is %s", host.OperatorState)
+	}
+	if host.LastProbeError != "" {
+		return host.LastProbeError
+	}
+	return "remote host is unreachable"
+}
+
+func (p *sessionProxy) forwardNotification(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedNotificationID) {
 	target, err := remoteNotificationURL(r.URL, host.Address, qualified.NotificationID)
 	if err != nil {
 		p.writeRemoteUnavailable(w, r, host, "build remote notification proxy target", err)
 		return
 	}
-	req, err := remoteProxyRequest(proxyCtx, r, target)
-	if err != nil {
-		p.writeRemoteUnavailable(w, r, host, "build remote notification proxy request", err)
-		return
-	}
-	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
-	if err != nil {
-		p.writeRemoteRequestError(w, r, host, "remote notification proxy failed", err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if isRedirect(resp.StatusCode) {
-		p.writeRemoteRedirect(w, r, host)
-		return
-	}
-	if err := p.writeQualifiedNotificationResponse(w, resp, qualified); err != nil {
-		p.log.Warn("qualify remote notification response failed", "hostId", host.HostID, "reason", err.Error())
-		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
-			fmt.Sprintf("Remote host %q returned an unqualifiable notification response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
-	}
+	p.forwardQualifiedResponse(w, r, host, target, "notification", func(writer http.ResponseWriter, response *http.Response) error {
+		return p.writeQualifiedNotificationResponse(writer, response, qualified)
+	})
 }
 
 // MarkAllRead forwards each group of qualified notification IDs to its owner.
@@ -275,21 +368,27 @@ func (p *sessionProxy) forwardStream(w http.ResponseWriter, r *http.Request, hos
 }
 
 func (p *sessionProxy) forward(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedSessionID) {
-	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
-	defer cancel()
 	target, err := remoteSessionURL(r.URL, host.Address, qualified.SessionID)
 	if err != nil {
 		p.writeRemoteUnavailable(w, r, host, "build remote session proxy target", err)
 		return
 	}
+	p.forwardQualifiedResponse(w, r, host, target, "session", func(writer http.ResponseWriter, response *http.Response) error {
+		return p.writeQualifiedResponse(writer, response, qualified)
+	})
+}
+
+func (p *sessionProxy) forwardQualifiedResponse(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, target *url.URL, kind string, qualify func(http.ResponseWriter, *http.Response) error) {
+	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
+	defer cancel()
 	req, err := remoteProxyRequest(proxyCtx, r, target)
 	if err != nil {
-		p.writeRemoteUnavailable(w, r, host, "build remote session proxy request", err)
+		p.writeRemoteUnavailable(w, r, host, "build remote "+kind+" proxy request", err)
 		return
 	}
 	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
-		p.writeRemoteRequestError(w, r, host, "remote session proxy failed", err)
+		p.writeRemoteRequestError(w, r, host, "remote "+kind+" proxy failed", err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -297,10 +396,10 @@ func (p *sessionProxy) forward(w http.ResponseWriter, r *http.Request, host doma
 		p.writeRemoteRedirect(w, r, host)
 		return
 	}
-	if err := p.writeQualifiedResponse(w, r, resp, qualified); err != nil {
-		p.log.Warn("qualify remote session response failed", "hostId", host.HostID, "reason", err.Error())
+	if err := qualify(w, resp); err != nil {
+		p.log.Warn("qualify remote "+kind+" response failed", "hostId", host.HostID, "reason", err.Error())
 		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
-			fmt.Sprintf("Remote host %q returned an unqualifiable session response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+			fmt.Sprintf("Remote host %q returned an unqualifiable %s response: %v", host.HostID, kind, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
 	}
 }
 
@@ -315,7 +414,7 @@ func remoteProxyRequest(ctx context.Context, source *http.Request, target *url.U
 	return req, nil
 }
 
-func (p *sessionProxy) writeQualifiedResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, qualified domain.QualifiedSessionID) error {
+func (p *sessionProxy) writeQualifiedResponse(w http.ResponseWriter, resp *http.Response, qualified domain.QualifiedSessionID) error {
 	if !isJSONResponse(resp.Header) || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
 		copyRemoteResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -441,7 +540,7 @@ func remoteSessionURL(in *url.URL, address string, sessionID domain.SessionID) (
 	return &url.URL{Scheme: "http", Host: address, Path: path, RawQuery: in.RawQuery}, nil
 }
 
-func remoteNotificationURL(in *url.URL, address string, notificationID string) (*url.URL, error) {
+func remoteNotificationURL(in *url.URL, address, notificationID string) (*url.URL, error) {
 	prefix := "/api/v1/notifications/"
 	if !strings.HasPrefix(in.Path, prefix) || strings.Contains(strings.TrimPrefix(in.Path, prefix), "/") {
 		return nil, fmt.Errorf("request is not a notification-bearing route")
