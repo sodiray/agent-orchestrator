@@ -17,8 +17,16 @@ func TestCommandInventoryProviderRejectsMalformedOversizedAndSlowOutput(t *testi
 		maxOutput int64
 		want      string
 	}{
-		{name: "malformed", mode: "malformed", timeout: time.Second, maxOutput: 1024, want: "decode inventory JSON"},
-		{name: "oversized", mode: "oversized", timeout: time.Second, maxOutput: 64, want: "output exceeds 64 bytes"},
+		// The helper is this test binary re-executed as a subprocess. Under -race
+		// that costs a meaningful fraction of a second to start, so a 1s budget
+		// here was racing process startup rather than exercising anything: the
+		// malformed case timed out and reported a TIMEOUT error, which is not
+		// the error it asserts. These two cases are about decoding and size
+		// limits, so their timeout is incidental and should be far out of reach.
+		{name: "malformed", mode: "malformed", timeout: 30 * time.Second, maxOutput: 1024, want: "decode inventory JSON"},
+		{name: "oversized", mode: "oversized", timeout: 30 * time.Second, maxOutput: 64, want: "output exceeds 64 bytes"},
+		// The slow case is the one where the timeout IS the subject, so it keeps
+		// a short one.
 		{name: "slow", mode: "slow", timeout: 10 * time.Millisecond, maxOutput: 1024, want: "timed out"},
 	}
 	for _, tc := range tests {
