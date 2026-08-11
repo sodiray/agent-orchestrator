@@ -37,8 +37,14 @@ const (
 	// session snapshot refresh. It leaves room for a forwarded connection
 	// to establish while still isolating an unreachable host from other probes.
 	DefaultRemoteHostProbeTimeout = 10 * time.Second
-	DefaultHostInventoryInterval  = 30 * time.Second
-	DefaultHostInventoryTimeout   = 10 * time.Second
+	// DefaultHostInventoryInterval balances timely external host discovery
+	// against the cost of invoking the operator-configured inventory command.
+	DefaultHostInventoryInterval = 30 * time.Second
+	// DefaultHostInventoryTimeout stops a stalled local inventory command from
+	// holding the remote-host worker indefinitely.
+	DefaultHostInventoryTimeout = 10 * time.Second
+	// DefaultHostInventoryMaxOutput bounds command output before JSON decoding
+	// so a misconfigured inventory source cannot exhaust daemon memory.
 	DefaultHostInventoryMaxOutput = 1 << 20
 	// DefaultAgent is the compatibility value used when AO_AGENT is unset. The
 	// daemon validates it at startup, but worker/orchestrator spawns resolve from

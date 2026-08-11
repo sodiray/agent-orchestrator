@@ -31,22 +31,32 @@ type ProjectIDParam struct {
 	ID string `path:"id" description:"Project identifier (registry key)."`
 }
 
+// RemoteHostIDParam is the operator-supplied host identity carried in remote
+// host routes and reflected into the OpenAPI path contract.
 type RemoteHostIDParam struct {
 	HostID string `path:"hostId" description:"Operator-supplied remote host identifier."`
 }
 
+// ListRemoteHostsResponse is the collection envelope returned by the remote
+// host registry endpoint.
 type ListRemoteHostsResponse struct {
 	RemoteHosts []remotehostsvc.Host `json:"remoteHosts"`
 }
 
+// RemoteHostResponse wraps one remote-host view for create, get, and state
+// update responses, keeping those wire shapes consistent.
 type RemoteHostResponse struct {
 	RemoteHost remotehostsvc.Host `json:"remoteHost"`
 }
 
+// UpdateRemoteHostStateRequest carries an explicit operator lifecycle decision
+// for a remote daemon.
 type UpdateRemoteHostStateRequest struct {
 	State string `json:"state" enum:"available,stopped,destroyed"`
 }
 
+// DeregisterRemoteHostResponse confirms which remote-host identity was removed
+// after a successful deregistration request.
 type DeregisterRemoteHostResponse struct {
 	HostID string `json:"hostId"`
 }

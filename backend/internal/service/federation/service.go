@@ -19,23 +19,33 @@ import (
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 )
 
+// DefaultListTimeout bounds each remote owner read so a slow host becomes
+// visible as unavailable instead of delaying the local board indefinitely.
 const (
 	DefaultListTimeout    = 2 * time.Second
 	remoteHostListWorkers = 8
 )
 
+// LocalSessions supplies the native session view that federation augments with
+// remote owner views.
 type LocalSessions interface {
 	List(ctx context.Context, filter sessionsvc.ListFilter) ([]domain.Session, error)
 }
 
+// LocalNotifications supplies local notification rows before remote rows and
+// partial-failure state are merged into one response.
 type LocalNotifications interface {
 	List(ctx context.Context, filter notificationsvc.ListFilter) (notificationsvc.ListPage, error)
 }
 
+// LocalProjects supplies local project summaries that are grouped with remote
+// project rows for the board.
 type LocalProjects interface {
 	List(ctx context.Context) ([]projectsvc.Summary, error)
 }
 
+// RemoteHostStore provides the registry and durable snapshot cache needed to
+// preserve remote content during an owning daemon outage.
 type RemoteHostStore interface {
 	ListRemoteHosts(ctx context.Context) ([]domain.RemoteHost, error)
 	GetRemoteHost(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error)
@@ -48,6 +58,8 @@ type HostPresence interface {
 	HasRegisteredHosts() bool
 }
 
+// Deps defines federation's local services, remote clients, and registry
+// boundary so aggregation remains independent of concrete adapters.
 type Deps struct {
 	Local              LocalSessions
 	Store              RemoteHostStore
@@ -61,6 +73,8 @@ type Deps struct {
 	Logger             *slog.Logger
 }
 
+// Service merges local content with remote daemon owner views while keeping
+// failures explicit and preserving last-known remote snapshots.
 type Service struct {
 	local              LocalSessions
 	store              RemoteHostStore
@@ -74,11 +88,15 @@ type Service struct {
 	log                *slog.Logger
 }
 
+// ListedSession represents either a native local session or a remote owner
+// view, allowing callers to preserve their distinct identity semantics.
 type ListedSession struct {
 	Local  *domain.Session
 	Remote *RemoteSession
 }
 
+// RemoteSession retains the owning daemon's serialized view with explicit
+// availability metadata when a snapshot is served during an outage.
 type RemoteSession struct {
 	HostID            domain.RemoteHostID
 	SessionID         domain.SessionID
@@ -87,6 +105,8 @@ type RemoteSession struct {
 	UnavailableReason string
 }
 
+// New creates a federation service with a bounded per-host timeout and a
+// default logger when wiring does not provide one.
 func New(deps Deps) *Service {
 	timeout := deps.Timeout
 	if timeout <= 0 {
@@ -144,11 +164,11 @@ func (s *Service) ListProjects(ctx context.Context) ([]projectsvc.Summary, error
 func (s *Service) listProjectHost(ctx context.Context, host domain.RemoteHost) listedProjectHost {
 	if host.OperatorState == domain.RemoteHostStateStopped || host.OperatorState == domain.RemoteHostStateDestroyed {
 		reason := fmt.Sprintf("remote host is %s", host.OperatorState)
-		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host, reason), reason: reason}
+		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host), reason: reason}
 	}
 	if s.projectClient == nil {
 		reason := "remote project client is unavailable"
-		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host, reason), reason: reason}
+		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host), reason: reason}
 	}
 	listCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
@@ -156,7 +176,7 @@ func (s *Service) listProjectHost(ctx context.Context, host domain.RemoteHost) l
 	if err != nil {
 		s.log.Warn("remote project list failed", "hostId", host.HostID, "address", host.Address, "err", err)
 		reason := remotedaemonhttp.UnavailabilityReason(err)
-		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host, reason), reason: reason}
+		return listedProjectHost{host: host, projects: s.unavailableProjects(ctx, host), reason: reason}
 	}
 	return listedProjectHost{host: host, projects: projects}
 }
@@ -214,7 +234,7 @@ func remoteProjectSummary(project ports.RemoteProjectSummary) projectsvc.Summary
 	return projectsvc.Summary{ID: project.ID, Name: project.Name, Path: project.Path, Kind: project.Kind.WithDefault(), SessionPrefix: project.SessionPrefix, OrchestratorAgent: project.OrchestratorAgent, ResolveError: project.ResolveError}
 }
 
-func (s *Service) unavailableProjects(ctx context.Context, host domain.RemoteHost, reason string) []ports.RemoteProjectSummary {
+func (s *Service) unavailableProjects(ctx context.Context, host domain.RemoteHost) []ports.RemoteProjectSummary {
 	// A remote project row may not be available during an outage. Snapshot views
 	// still carry projectId, which is enough to retain a workspace for every
 	// cached session instead of allowing it to disappear from the board.
@@ -453,6 +473,8 @@ func forEachRemoteHost(ctx context.Context, hosts []domain.RemoteHost, visit fun
 	group.Wait()
 }
 
+// Resolve returns the registry record for a qualified host identity so proxy
+// and stream surfaces can contact only its owning daemon.
 func (s *Service) Resolve(ctx context.Context, id domain.RemoteHostID) (domain.RemoteHost, bool, error) {
 	return s.store.GetRemoteHost(ctx, id)
 }

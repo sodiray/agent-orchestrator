@@ -18,6 +18,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/remotedaemonhttp"
 )
 
+// Default probe settings keep remote availability fresh without allowing one
+// unreachable host to monopolize the daemon's background work.
 const (
 	DefaultProbeInterval = 30 * time.Second
 	DefaultProbeTimeout  = config.DefaultRemoteHostProbeTimeout
@@ -26,6 +28,8 @@ const (
 	inventoryAbsenceReads  = 2
 )
 
+// Store persists registered remote hosts, probe outcomes, and cached owner
+// views while the service owns lifecycle and validation policy.
 type Store interface {
 	CreateRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error)
 	UpsertRemoteHost(ctx context.Context, host domain.RemoteHost) (bool, error)
@@ -37,6 +41,8 @@ type Store interface {
 	DeleteRemoteHost(ctx context.Context, id domain.RemoteHostID) (bool, error)
 }
 
+// Manager is the remote-host API boundary used by HTTP controllers and other
+// services without exposing storage details.
 type Manager interface {
 	Register(ctx context.Context, in RegisterInput) (Host, error)
 	List(ctx context.Context) ([]Host, error)
@@ -47,12 +53,16 @@ type Manager interface {
 	Deregister(ctx context.Context, id domain.RemoteHostID) error
 }
 
+// RegisterInput carries the operator-supplied identity and endpoint for a
+// remote daemon being added to federation.
 type RegisterInput struct {
 	HostID  string `json:"hostId"`
 	Address string `json:"address"`
 	Label   string `json:"label,omitempty"`
 }
 
+// Host is the service-facing remote-host view, including inventory and probe
+// information needed by clients to present availability accurately.
 type Host struct {
 	HostID             string                 `json:"hostId"`
 	Address            string                 `json:"address"`
@@ -67,12 +77,16 @@ type Host struct {
 	InventoryError     string                 `json:"inventoryError,omitempty"`
 }
 
+// Inventory is the combined registered and externally discovered host view,
+// with refresh health retained separately from individual probes.
 type Inventory struct {
 	Hosts  []Host
 	Stale  bool
 	Reason string
 }
 
+// Deps supplies the durable and runtime collaborators required to manage
+// registered remote daemons without hard-coding adapter implementations.
 type Deps struct {
 	Store             Store
 	Prober            ports.RemoteDaemonProber
@@ -84,6 +98,8 @@ type Deps struct {
 	InventoryInterval time.Duration
 }
 
+// Service validates remote-host changes and coordinates probing, inventory
+// reconciliation, and cached session snapshots for federation.
 type Service struct {
 	store         Store
 	prober        ports.RemoteDaemonProber
@@ -121,6 +137,8 @@ type healthProbeWorker struct {
 
 var _ Manager = (*Service)(nil)
 
+// New creates a remote-host service with safe default timeouts and empty
+// in-memory inventory state for daemon startup.
 func New(deps Deps) *Service {
 	clock := deps.Clock
 	if clock == nil {
@@ -162,10 +180,14 @@ func (s *Service) HasRegisteredHosts() bool {
 	return s.count.Load() > 0
 }
 
+// HasHostInventory reports whether registration or external inventory can
+// produce host rows, so callers can avoid starting unnecessary workers.
 func (s *Service) HasHostInventory() bool {
 	return s.HasRegisteredHosts() || s.inventory != nil
 }
 
+// Register validates and upserts an operator-provided remote daemon, then
+// probes it immediately so its returned state is meaningful to the caller.
 func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) {
 	id := domain.RemoteHostID(strings.TrimSpace(in.HostID))
 	if err := domain.ValidateRemoteHostID(id); err != nil {
@@ -207,6 +229,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Host, error) 
 	return s.probe(ctx, host)
 }
 
+// List returns registered hosts in stable identity order for API consumers.
 func (s *Service) List(ctx context.Context) ([]Host, error) {
 	hosts, err := s.store.ListRemoteHosts(ctx)
 	if err != nil {
@@ -221,6 +244,8 @@ func (s *Service) List(ctx context.Context) ([]Host, error) {
 	return out, nil
 }
 
+// Inventory merges registered hosts with the latest external inventory while
+// preserving stale-refresh information for callers to display.
 func (s *Service) Inventory(ctx context.Context) (Inventory, error) {
 	hosts, err := s.store.ListRemoteHosts(ctx)
 	if err != nil {
@@ -246,6 +271,8 @@ func (s *Service) Inventory(ctx context.Context) (Inventory, error) {
 	return Inventory{Hosts: out, Stale: stale, Reason: reason}, nil
 }
 
+// Get validates id and returns its registered remote host or a typed not-found
+// error suitable for the HTTP boundary.
 func (s *Service) Get(ctx context.Context, id domain.RemoteHostID) (Host, error) {
 	if err := domain.ValidateRemoteHostID(id); err != nil {
 		return Host{}, apierr.Invalid("INVALID_REMOTE_HOST_ID", err.Error(), nil)
@@ -261,6 +288,8 @@ func (s *Service) Get(ctx context.Context, id domain.RemoteHostID) (Host, error)
 	return hostView(host), nil
 }
 
+// UpdateState applies an operator stop, destroy, or resume decision and probes
+// a resumed host so stale availability is not retained.
 func (s *Service) UpdateState(ctx context.Context, id domain.RemoteHostID, state domain.RemoteHostState) (Host, error) {
 	if err := domain.ValidateRemoteHostID(id); err != nil {
 		return Host{}, apierr.Invalid("INVALID_REMOTE_HOST_ID", err.Error(), nil)
@@ -299,6 +328,8 @@ func (s *Service) UpdateState(ctx context.Context, id domain.RemoteHostID, state
 	}
 }
 
+// Deregister removes a registered host and stops background probing when no
+// registry or inventory rows remain to be maintained.
 func (s *Service) Deregister(ctx context.Context, id domain.RemoteHostID) error {
 	if err := domain.ValidateRemoteHostID(id); err != nil {
 		return apierr.Invalid("INVALID_REMOTE_HOST_ID", err.Error(), nil)
@@ -427,11 +458,9 @@ func (s *Service) probeAll(ctx context.Context) {
 			if listed.Lifecycle == InventoryLifecycleStopped {
 				continue
 			}
-			host := host
 			jobsToRun = append(jobsToRun, func(ctx context.Context) error { return s.probeInventory(ctx, listed, host) })
 			continue
 		}
-		host := host
 		jobsToRun = append(jobsToRun, func(ctx context.Context) error {
 			_, err := s.probe(ctx, host)
 			return err
@@ -441,7 +470,6 @@ func (s *Service) probeAll(ctx context.Context) {
 		if _, exists := registered[id]; exists || listed.Lifecycle == InventoryLifecycleStopped {
 			continue
 		}
-		listed := listed
 		jobsToRun = append(jobsToRun, func(ctx context.Context) error { return s.probeInventory(ctx, listed, domain.RemoteHost{}) })
 	}
 	workers := min(len(jobsToRun), remoteHostProbeWorkers)

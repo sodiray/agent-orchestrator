@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+// UnavailabilityReason turns transport failures into stable, operator-readable
+// remote-host status while preserving unexpected errors for diagnosis.
 func UnavailabilityReason(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "remote host did not respond before the timeout"
