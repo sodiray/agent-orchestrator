@@ -6102,6 +6102,10 @@ components:
           type: string
         agentRulesFile:
           type: string
+        autoTitle:
+          type: boolean
+        concurrentProjectRoot:
+          type: boolean
         containerReap:
           $ref: '#/components/schemas/ContainerReapConfig'
         defaultBranch:
@@ -6110,6 +6114,8 @@ components:
           additionalProperties:
             type: string
           type: object
+        envFile:
+          type: string
         orchestrator:
           $ref: '#/components/schemas/RoleOverride'
         orchestratorRules:
@@ -7003,6 +7009,10 @@ components:
           type: string
         launchId:
           description: AO process generation that produced the signal.
+          type: string
+        prompt:
+          description: User message body, sent with user-prompt-submit so a session
+            can name itself from its first prompt.
           type: string
         state:
           description: Agent activity state reported by an agent hook. Optional for

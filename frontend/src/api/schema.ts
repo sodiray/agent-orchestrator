@@ -2067,11 +2067,14 @@ export interface components {
             agentConfig?: components["schemas"]["AgentConfig"];
             agentRules?: string;
             agentRulesFile?: string;
+            autoTitle?: boolean;
+            concurrentProjectRoot?: boolean;
             containerReap?: components["schemas"]["ContainerReapConfig"];
             defaultBranch?: string;
             env?: {
                 [key: string]: string;
             };
+            envFile?: string;
             orchestrator?: components["schemas"]["RoleOverride"];
             orchestratorRules?: string;
             postCreate?: string[];
@@ -2415,6 +2418,8 @@ export interface components {
             event?: string;
             /** @description AO process generation that produced the signal. */
             launchId?: string;
+            /** @description User message body, sent with user-prompt-submit so a session can name itself from its first prompt. */
+            prompt?: string;
             /**
              * @description Agent activity state reported by an agent hook. Optional for metadata-only hooks.
              * @enum {string}

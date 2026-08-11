@@ -90,8 +90,8 @@ func hookPromptBody(event string, payload []byte) string {
 		return ""
 	}
 	var p struct {
-		Prompt      string `json:"prompt"`
-		UserPrompt  string `json:"user_prompt"`
+		Prompt     string `json:"prompt"`
+		UserPrompt string `json:"user_prompt"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return ""
