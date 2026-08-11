@@ -98,18 +98,21 @@ type trackerIntakeConfig struct {
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
-	DefaultBranch     string              `json:"defaultBranch,omitempty"`
-	SessionPrefix     string              `json:"sessionPrefix,omitempty"`
-	Env               map[string]string   `json:"env,omitempty"`
-	Symlinks          []string            `json:"symlinks,omitempty"`
-	PostCreate        []string            `json:"postCreate,omitempty"`
-	AgentRules        string              `json:"agentRules,omitempty"`
-	AgentRulesFile    string              `json:"agentRulesFile,omitempty"`
-	OrchestratorRules string              `json:"orchestratorRules,omitempty"`
-	AgentConfig       agentConfig         `json:"agentConfig,omitempty"`
-	Worker            roleOverride        `json:"worker,omitempty"`
-	Orchestrator      roleOverride        `json:"orchestrator,omitempty"`
-	TrackerIntake     trackerIntakeConfig `json:"trackerIntake,omitempty"`
+	DefaultBranch         string              `json:"defaultBranch,omitempty"`
+	SessionPrefix         string              `json:"sessionPrefix,omitempty"`
+	Env                   map[string]string   `json:"env,omitempty"`
+	EnvFile               string              `json:"envFile,omitempty"`
+	ConcurrentProjectRoot bool                `json:"concurrentProjectRoot,omitempty"`
+	AutoTitle             bool                `json:"autoTitle,omitempty"`
+	Symlinks              []string            `json:"symlinks,omitempty"`
+	PostCreate            []string            `json:"postCreate,omitempty"`
+	AgentRules            string              `json:"agentRules,omitempty"`
+	AgentRulesFile        string              `json:"agentRulesFile,omitempty"`
+	OrchestratorRules     string              `json:"orchestratorRules,omitempty"`
+	AgentConfig           agentConfig         `json:"agentConfig,omitempty"`
+	Worker                roleOverride        `json:"worker,omitempty"`
+	Orchestrator          roleOverride        `json:"orchestrator,omitempty"`
+	TrackerIntake         trackerIntakeConfig `json:"trackerIntake,omitempty"`
 }
 
 // setConfigRequest mirrors the daemon's SetConfigInput body for
@@ -119,24 +122,27 @@ type setConfigRequest struct {
 }
 
 type projectSetConfigOptions struct {
-	defaultBranch     string
-	sessionPrefix     string
-	model             string
-	permission        string
-	workerAgent       string
-	orchestratorAgent string
-	agentRules        string
-	agentRulesFile    string
-	orchestratorRules string
-	env               []string
-	symlink           []string
-	postCreate        []string
-	trackerIntake     bool
-	trackerRepo       string
-	trackerAssignee   string
-	configJSON        string
-	clear             bool
-	json              bool
+	defaultBranch         string
+	sessionPrefix         string
+	model                 string
+	permission            string
+	workerAgent           string
+	orchestratorAgent     string
+	agentRules            string
+	agentRulesFile        string
+	envFile               string
+	concurrentProjectRoot bool
+	autoTitle             bool
+	orchestratorRules     string
+	env                   []string
+	symlink               []string
+	postCreate            []string
+	trackerIntake         bool
+	trackerRepo           string
+	trackerAssignee       string
+	configJSON            string
+	clear                 bool
+	json                  bool
 }
 
 type projectListResult struct {
@@ -318,6 +324,9 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.orchestratorAgent, "orchestrator-agent", "", "Harness override for orchestrator sessions")
 	f.StringVar(&opts.agentRules, "agent-rules", "", "Project-specific standing instructions for worker sessions")
 	f.StringVar(&opts.agentRulesFile, "agent-rules-file", "", "Repo-relative file containing worker standing instructions")
+	f.StringVar(&opts.envFile, "env-file", "", "Repo-relative KEY=VALUE file whose entries are forwarded into sessions")
+	f.BoolVar(&opts.concurrentProjectRoot, "concurrent-project-root", false, "Allow more than one live project-root session in this project")
+	f.BoolVar(&opts.autoTitle, "auto-title", false, "Rename a session from its first user prompt")
 	f.StringVar(&opts.orchestratorRules, "orchestrator-rules", "", "Project-specific standing instructions for orchestrator sessions")
 	f.StringArrayVar(&opts.env, "env", nil, "Env var KEY=VALUE forwarded into sessions (repeatable)")
 	f.StringArrayVar(&opts.symlink, "symlink", nil, "Repo-relative path to symlink into workspaces (repeatable)")
@@ -352,17 +361,20 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 		return projectConfig{}, err
 	}
 	cfg := projectConfig{
-		DefaultBranch:     opts.defaultBranch,
-		SessionPrefix:     opts.sessionPrefix,
-		Env:               env,
-		Symlinks:          opts.symlink,
-		PostCreate:        opts.postCreate,
-		AgentRules:        opts.agentRules,
-		AgentRulesFile:    opts.agentRulesFile,
-		OrchestratorRules: opts.orchestratorRules,
-		AgentConfig:       agentConfig{Model: opts.model, Permissions: opts.permission},
-		Worker:            roleOverride{Agent: opts.workerAgent},
-		Orchestrator:      roleOverride{Agent: opts.orchestratorAgent},
+		DefaultBranch:         opts.defaultBranch,
+		SessionPrefix:         opts.sessionPrefix,
+		Env:                   env,
+		Symlinks:              opts.symlink,
+		PostCreate:            opts.postCreate,
+		AgentRules:            opts.agentRules,
+		AgentRulesFile:        opts.agentRulesFile,
+		EnvFile:               opts.envFile,
+		ConcurrentProjectRoot: opts.concurrentProjectRoot,
+		AutoTitle:             opts.autoTitle,
+		OrchestratorRules:     opts.orchestratorRules,
+		AgentConfig:           agentConfig{Model: opts.model, Permissions: opts.permission},
+		Worker:                roleOverride{Agent: opts.workerAgent},
+		Orchestrator:          roleOverride{Agent: opts.orchestratorAgent},
 		TrackerIntake: trackerIntakeConfig{
 			Enabled:  opts.trackerIntake,
 			Provider: trackerProviderForFlags(opts),

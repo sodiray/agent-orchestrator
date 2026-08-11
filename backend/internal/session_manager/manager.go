@@ -533,10 +533,15 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		if strings.TrimSpace(cfg.Branch) != "" {
 			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: --branch cannot be used with project-root workspace mode")
 		}
+		// The lock is still taken when concurrency is allowed: it serializes the
+		// workspace materialization itself, which is not the same thing as the
+		// one-session rule it also guards.
 		unlock := m.lockProjectRoot(cfg.ProjectID)
 		defer unlock()
-		if err := m.ensureProjectRootAvailable(ctx, cfg.ProjectID); err != nil {
-			return domain.SessionRecord{}, 0, 0, err
+		if !project.Config.ConcurrentProjectRoot {
+			if err := m.ensureProjectRootAvailable(ctx, cfg.ProjectID); err != nil {
+				return domain.SessionRecord{}, 0, 0, err
+			}
 		}
 	}
 	cfg.WorkspaceMode = workspaceMode
@@ -667,7 +672,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn %s: no agent adapter for harness %q", id, cfg.Harness)
 	}
 	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Kind, project.Config), cfg.AgentConfig)
-	env := m.runtimeEnv(id, cfg.ProjectID, cfg.IssueID, project.Config.Env)
+	env, err := m.runtimeEnv(id, project, cfg.IssueID)
+	if err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn %s: %w", id, err)
+	}
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, id, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
@@ -1538,7 +1546,10 @@ func (m *Manager) relaunchSessionWithPolicy(ctx context.Context, operation strin
 	// Restore re-applies the project's resolved agent config so a configured
 	// model/permissions carry across a restore, matching fresh spawn.
 	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
-	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
+	env, err := m.runtimeEnv(rec.ID, project, rec.IssueID)
+	if err != nil {
+		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, err)
+	}
 	m.augmentAgentRuntimeEnv(agent, env)
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, err)
@@ -3111,8 +3122,16 @@ func spawnEnv(id domain.SessionID, project domain.ProjectID, issue domain.IssueI
 // runtimeEnv is spawnEnv plus a temporary PATH compatibility pin for settings
 // files written by older releases. Newly installed hooks record an absolute
 // daemon executable and do not depend on PATH.
-func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectID, issue domain.IssueID, projectEnv map[string]string) map[string]string {
-	env := spawnEnv(id, project, issue, m.dataDir, projectEnv)
+// runtimeEnv takes the whole project rather than its Env map so the configured
+// EnvFile is resolved in exactly one place. Passing the map instead would leave
+// each caller to remember to load the file, and the one that forgot would spawn
+// a session missing its credentials without any error.
+func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectRecord, issue domain.IssueID) (map[string]string, error) {
+	projectEnv, err := loadProjectEnv(project)
+	if err != nil {
+		return nil, err
+	}
+	env := spawnEnv(id, domain.ProjectID(project.ID), issue, m.dataDir, projectEnv)
 	if m.browserCapabilities != nil {
 		env[EnvBrowserCapability] = m.browserCapabilities.Token(id)
 	}
@@ -3121,10 +3140,10 @@ func (m *Manager) runtimeEnv(id domain.SessionID, project domain.ProjectID, issu
 	if err != nil {
 		m.logger.Warn("session PATH not pinned to the daemon binary; unrepaired legacy hook commands may resolve to a different ao",
 			"session", id, "error", err)
-		return env
+		return env, nil
 	}
 	env["PATH"] = path
-	return env
+	return env, nil
 }
 
 // HookPATH builds the temporary PATH compatibility pin for legacy hook
@@ -3327,8 +3346,16 @@ func (m *Manager) cleanupAgentWorkspace(ctx context.Context, rec domain.SessionR
 		return
 	}
 	env := spawnEnv(rec.ID, rec.ProjectID, rec.IssueID, m.dataDir, nil)
+	// Cleanup is best-effort and must not be blocked by a project whose env is
+	// unreadable: refusing to clean up would strand the workspace over config
+	// that no longer matters once the session is gone.
 	if project, err := m.loadProject(ctx, rec.ProjectID); err == nil {
-		env = m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
+		if resolved, envErr := m.runtimeEnv(rec.ID, project, rec.IssueID); envErr == nil {
+			env = resolved
+		} else {
+			m.logger.Warn("workspace cleanup: project env unresolved; agent cleanup using AO env only",
+				"sessionID", rec.ID, "projectID", rec.ProjectID, "error", envErr)
+		}
 	} else {
 		m.logger.Warn("workspace cleanup: project env unavailable; agent cleanup using AO env only",
 			"sessionID", rec.ID, "projectID", rec.ProjectID, "error", err)

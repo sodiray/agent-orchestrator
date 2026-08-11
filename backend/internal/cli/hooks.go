@@ -49,6 +49,7 @@ type setActivityAPIRequest struct {
 	ToolUseID      string             `json:"toolUseId,omitempty"`
 	AgentSessionID string             `json:"agentSessionId,omitempty"`
 	LaunchID       string             `json:"launchId,omitempty"`
+	Prompt         string             `json:"prompt,omitempty"`
 	Usage          *usageHookMetadata `json:"usage,omitempty"`
 }
 
@@ -81,6 +82,26 @@ const maxActivityMetaLen = 256
 // them (claude-code's PreToolUse/PostToolUse/PostToolUseFailure and
 // PermissionRequest payloads); adapters whose payloads lack them yield empty
 // strings and the signal degrades to today's state-only form.
+// hookPromptBody returns the user's message from a user-prompt-submit payload.
+// Harnesses spell the field differently, so both spellings are accepted; an
+// absent field simply means no title can be derived, which is not an error.
+func hookPromptBody(event string, payload []byte) string {
+	if event != "user-prompt-submit" {
+		return ""
+	}
+	var p struct {
+		Prompt      string `json:"prompt"`
+		UserPrompt  string `json:"user_prompt"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	if v := strings.TrimSpace(p.Prompt); v != "" {
+		return v
+	}
+	return strings.TrimSpace(p.UserPrompt)
+}
+
 func activityMeta(payload []byte) (toolName, toolUseID string) {
 	var p struct {
 		ToolName  string `json:"tool_name"`
@@ -217,12 +238,14 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 	}
 
 	toolName, toolUseID := activityMeta(payload)
+	prompt := hookPromptBody(event, payload)
 	path := "sessions/" + url.PathEscape(sessionID) + "/activity"
 	req := setActivityAPIRequest{
 		Event:          event,
 		ToolName:       toolName,
 		ToolUseID:      toolUseID,
 		AgentSessionID: agentSessionID,
+		Prompt:         prompt,
 		LaunchID:       validLaunchID(os.Getenv("AO_RUNTIME_LAUNCH_ID")),
 		Usage:          usage,
 	}

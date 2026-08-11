@@ -26,6 +26,38 @@ type ProjectConfig struct {
 	// Env are extra environment variables forwarded into worker session
 	// runtimes. AO-internal vars (AO_SESSION, AO_PROJECT_ID, …) always win.
 	Env map[string]string `json:"env,omitempty"`
+	// EnvFile is a repo-relative KEY=VALUE file whose entries are forwarded into
+	// worker session runtimes, for projects whose agents need credentials the
+	// daemon's own environment does not carry. Env takes precedence over it, and
+	// AO-internal vars still win over both.
+	//
+	// It exists because a session's environment is otherwise inherited from the
+	// daemon, and the daemon's environment depends on how it happened to be
+	// started — a desktop launch from Finder carries almost nothing. Config that
+	// varies with the launcher fails silently and long after the fact, which is
+	// exactly what a file read at spawn avoids. Storing the values in Env instead
+	// would work, but copies secrets into AO's database and leaves that copy to
+	// drift out of date the first time one is rotated.
+	EnvFile string `json:"envFile,omitempty"`
+	// ConcurrentProjectRoot allows more than one live project-root session in
+	// this project at a time.
+	//
+	// The default refusal is the right one: two agents editing one working tree
+	// will interleave edits, and a branch switch under a running agent is worse
+	// still. But that reasoning assumes sessions are branch-per-session work. It
+	// does not hold for a repo worked directly on its default branch, where
+	// running several agents side by side in the one checkout is the intended
+	// workflow rather than an accident — and there the refusal blocks the second
+	// session with an error about a workspace the operator is deliberately
+	// sharing. Opt in per project so the safe default stays the default.
+	ConcurrentProjectRoot bool `json:"concurrentProjectRoot,omitempty"`
+	// AutoTitle renames a session from its first user prompt.
+	//
+	// A session has to be named when it is spawned, which is the one moment the
+	// operator knows least about what it is for. The first prompt is the earliest
+	// point the session can describe itself, so it names it then and never again:
+	// once a session carries a prompt, any later name is a human's and is kept.
+	AutoTitle bool `json:"autoTitle,omitempty"`
 	// Symlinks are repo-relative paths symlinked into each session workspace.
 	Symlinks []string `json:"symlinks,omitempty"`
 	// PostCreate are shell commands run in the workspace after it is created.
@@ -164,6 +196,9 @@ func (c ProjectConfig) Validate() error {
 	}
 	if err := validateRepoRelative(c.AgentRulesFile); err != nil {
 		return fmt.Errorf("agentRulesFile %q: %w", c.AgentRulesFile, err)
+	}
+	if err := validateRepoRelative(c.EnvFile); err != nil {
+		return fmt.Errorf("envFile %q: %w", c.EnvFile, err)
 	}
 	for i, rv := range c.Reviewers {
 		if !rv.Harness.IsKnown() {

@@ -749,6 +749,7 @@ type SetActivityRequest struct {
 	ToolUseID      string             `json:"toolUseId,omitempty" description:"Native tool-use id, for tool-use hook events."`
 	AgentSessionID string             `json:"agentSessionId,omitempty" description:"Native agent session identifier used to resume its transcript."`
 	LaunchID       string             `json:"launchId,omitempty" description:"AO process generation that produced the signal."`
+	Prompt         string             `json:"prompt,omitempty" description:"User message body, sent with user-prompt-submit so a session can name itself from its first prompt."`
 	Usage          *UsageHookMetadata `json:"usage,omitempty" description:"Provider transcript metadata used by the local usage pipeline."`
 }
 

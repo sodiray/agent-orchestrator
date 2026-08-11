@@ -365,6 +365,12 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 // native agent session id carried alongside it. Metadata-only hooks leave the
 // existing activity and first-signal facts untouched.
 func (m *Manager) ApplyActivitySignal(ctx context.Context, id domain.SessionID, s ports.ActivitySignal) error {
+	// A first prompt names its session. Independent of the activity reduction
+	// below, and deliberately before it: the naming must not depend on which of
+	// the reducer's many early returns this particular signal takes.
+	if s.Event == "user-prompt-submit" {
+		m.autoTitle(ctx, id, s.Prompt)
+	}
 	s.AgentSessionID = strings.TrimSpace(s.AgentSessionID)
 	s.LaunchID = strings.TrimSpace(s.LaunchID)
 	s.ControllerGeneration = strings.TrimSpace(s.ControllerGeneration)
