@@ -37,7 +37,12 @@ func Client(base *http.Client, socketPath string) *http.Client {
 	}
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok || transport == nil {
-		transport = http.DefaultTransport.(*http.Transport).Clone()
+		defaultTransport, isHTTPTransport := http.DefaultTransport.(*http.Transport)
+		if isHTTPTransport {
+			transport = defaultTransport.Clone()
+		} else {
+			transport = &http.Transport{}
+		}
 	} else {
 		transport = transport.Clone()
 	}

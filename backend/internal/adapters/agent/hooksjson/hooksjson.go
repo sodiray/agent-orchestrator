@@ -324,15 +324,6 @@ func addHook(groups []MatcherGroup, hook HookEntry, matcher *string) []MatcherGr
 	return append(groups, MatcherGroup{Matcher: matcher, Hooks: []HookEntry{hook}})
 }
 
-// removeManaged strips AO hook entries (matched by command prefix) from every
-// group, dropping any group left without hooks so the event array doesn't
-// accumulate empty matcher objects.
-func removeManaged(groups []MatcherGroup, prefix string) []MatcherGroup {
-	return removeManagedMatching(groups, func(command string) bool {
-		return strings.HasPrefix(command, prefix)
-	})
-}
-
 func removeManagedMatching(groups []MatcherGroup, matches func(command string) bool) []MatcherGroup {
 	result := make([]MatcherGroup, 0, len(groups))
 	for _, group := range groups {

@@ -129,7 +129,7 @@ func (s *federatedNotificationStream) readRemoteNotificationEvents(ctx context.C
 		query.Set("projectId", string(projectID))
 	}
 	endpoint.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil) // #nosec G704 -- target is a registered remote-host endpoint.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), http.NoBody) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
 		return fmt.Errorf("build remote notification stream request: %w", err)
 	}

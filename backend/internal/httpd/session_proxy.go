@@ -213,7 +213,7 @@ func (p *sessionProxy) forwardTargetedCreation(w http.ResponseWriter, r *http.Re
 		p.writeRemoteRedirect(w, r, host)
 		return true
 	}
-	if err := p.writeQualifiedResponse(w, r, resp, domain.QualifiedSessionID{HostID: host.HostID}); err != nil {
+	if err := p.writeQualifiedResponse(w, resp, domain.QualifiedSessionID{HostID: host.HostID}); err != nil {
 		p.log.Warn("qualify remote creation response failed", "hostId", host.HostID, "reason", err.Error())
 		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
 			fmt.Sprintf("Remote host %q returned an unqualifiable creation response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
@@ -239,33 +239,14 @@ func remoteHostUnavailabilityReason(host domain.RemoteHost) string {
 }
 
 func (p *sessionProxy) forwardNotification(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedNotificationID) {
-	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
-	defer cancel()
 	target, err := remoteNotificationURL(r.URL, host.Address, qualified.NotificationID)
 	if err != nil {
 		p.writeRemoteUnavailable(w, r, host, "build remote notification proxy target", err)
 		return
 	}
-	req, err := remoteProxyRequest(proxyCtx, r, target)
-	if err != nil {
-		p.writeRemoteUnavailable(w, r, host, "build remote notification proxy request", err)
-		return
-	}
-	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
-	if err != nil {
-		p.writeRemoteRequestError(w, r, host, "remote notification proxy failed", err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if isRedirect(resp.StatusCode) {
-		p.writeRemoteRedirect(w, r, host)
-		return
-	}
-	if err := p.writeQualifiedNotificationResponse(w, resp, qualified); err != nil {
-		p.log.Warn("qualify remote notification response failed", "hostId", host.HostID, "reason", err.Error())
-		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
-			fmt.Sprintf("Remote host %q returned an unqualifiable notification response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
-	}
+	p.forwardQualifiedResponse(w, r, host, target, "notification", func(writer http.ResponseWriter, response *http.Response) error {
+		return p.writeQualifiedNotificationResponse(writer, response, qualified)
+	})
 }
 
 // MarkAllRead forwards each group of qualified notification IDs to its owner.
@@ -387,21 +368,27 @@ func (p *sessionProxy) forwardStream(w http.ResponseWriter, r *http.Request, hos
 }
 
 func (p *sessionProxy) forward(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, qualified domain.QualifiedSessionID) {
-	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
-	defer cancel()
 	target, err := remoteSessionURL(r.URL, host.Address, qualified.SessionID)
 	if err != nil {
 		p.writeRemoteUnavailable(w, r, host, "build remote session proxy target", err)
 		return
 	}
+	p.forwardQualifiedResponse(w, r, host, target, "session", func(writer http.ResponseWriter, response *http.Response) error {
+		return p.writeQualifiedResponse(writer, response, qualified)
+	})
+}
+
+func (p *sessionProxy) forwardQualifiedResponse(w http.ResponseWriter, r *http.Request, host domain.RemoteHost, target *url.URL, kind string, qualify func(http.ResponseWriter, *http.Response) error) {
+	proxyCtx, cancel := context.WithTimeout(r.Context(), remoteSessionProxyTimeout)
+	defer cancel()
 	req, err := remoteProxyRequest(proxyCtx, r, target)
 	if err != nil {
-		p.writeRemoteUnavailable(w, r, host, "build remote session proxy request", err)
+		p.writeRemoteUnavailable(w, r, host, "build remote "+kind+" proxy request", err)
 		return
 	}
 	resp, err := p.client.Do(req) // #nosec G704 -- target is a registered remote-host endpoint.
 	if err != nil {
-		p.writeRemoteRequestError(w, r, host, "remote session proxy failed", err)
+		p.writeRemoteRequestError(w, r, host, "remote "+kind+" proxy failed", err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -409,10 +396,10 @@ func (p *sessionProxy) forward(w http.ResponseWriter, r *http.Request, host doma
 		p.writeRemoteRedirect(w, r, host)
 		return
 	}
-	if err := p.writeQualifiedResponse(w, r, resp, qualified); err != nil {
-		p.log.Warn("qualify remote session response failed", "hostId", host.HostID, "reason", err.Error())
+	if err := qualify(w, resp); err != nil {
+		p.log.Warn("qualify remote "+kind+" response failed", "hostId", host.HostID, "reason", err.Error())
 		envelope.WriteAPIError(w, r, http.StatusBadGateway, "bad_gateway", "REMOTE_HOST_INVALID_RESPONSE",
-			fmt.Sprintf("Remote host %q returned an unqualifiable session response: %v", host.HostID, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
+			fmt.Sprintf("Remote host %q returned an unqualifiable %s response: %v", host.HostID, kind, err), map[string]any{"hostId": host.HostID, "reason": err.Error()})
 	}
 }
 
@@ -427,7 +414,7 @@ func remoteProxyRequest(ctx context.Context, source *http.Request, target *url.U
 	return req, nil
 }
 
-func (p *sessionProxy) writeQualifiedResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, qualified domain.QualifiedSessionID) error {
+func (p *sessionProxy) writeQualifiedResponse(w http.ResponseWriter, resp *http.Response, qualified domain.QualifiedSessionID) error {
 	if !isJSONResponse(resp.Header) || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
 		copyRemoteResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -553,7 +540,7 @@ func remoteSessionURL(in *url.URL, address string, sessionID domain.SessionID) (
 	return &url.URL{Scheme: "http", Host: address, Path: path, RawQuery: in.RawQuery}, nil
 }
 
-func remoteNotificationURL(in *url.URL, address string, notificationID string) (*url.URL, error) {
+func remoteNotificationURL(in *url.URL, address, notificationID string) (*url.URL, error) {
 	prefix := "/api/v1/notifications/"
 	if !strings.HasPrefix(in.Path, prefix) || strings.Contains(strings.TrimPrefix(in.Path, prefix), "/") {
 		return nil, fmt.Errorf("request is not a notification-bearing route")

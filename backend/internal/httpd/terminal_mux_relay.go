@@ -29,7 +29,6 @@ type terminalMuxRelay struct {
 	mu      sync.Mutex
 	remotes map[domain.RemoteHostID]*remoteMux
 	closed  bool
-	cancel  context.CancelFunc
 }
 
 type remoteMux struct {
@@ -119,7 +118,10 @@ func (r *terminalMuxRelay) remote(ctx context.Context, hostID domain.RemoteHostI
 		return nil, fmt.Errorf("remote host is %s", host.OperatorState)
 	}
 	endpoint := "ws://" + host.Address + "/mux"
-	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: remotedaemonhttp.NewClient(0)}) // #nosec G704 -- target is a registered remote-host endpoint.
+	conn, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: remotedaemonhttp.NewClient(0)}) // #nosec G704 -- target is a registered remote-host endpoint.
+	if response != nil && response.Body != nil {
+		defer func() { _ = response.Body.Close() }()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("connect remote mux: %w", err)
 	}

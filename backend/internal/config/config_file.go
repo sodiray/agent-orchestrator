@@ -52,7 +52,8 @@ func loadConfigFile(dataDir string) (daemonConfigFile, string, error) {
 	if err != nil {
 		return daemonConfigFile{}, path, fmt.Errorf("open daemon configuration file %s: %w", path, err)
 	}
-	defer file.Close()
+	// The file is read-only; a close error cannot change the parsed configuration.
+	defer func() { _ = file.Close() }()
 
 	info, err := file.Stat()
 	if err != nil {
